@@ -1,0 +1,30 @@
+# build output (./build.ps1 makes these)
+build/
+*.elf
+*.nso
+*.nsp
+*.npdm
+*.ovl
+*.nacp
+*.map
+*.o
+*.d
+dist/
+dist-variants/
+
+# your own toolchain paths (see build.ps1)
+toolchain.local.ps1
+
+# tokens, settings and logs, should any end up here
+token.txt
+token.ini
+settings.ini
+people.ini
+*.log
+
+# the tests' references and output (test/run.sh says how to fetch and build them)
+test/out/
+test/interop/out/
+test/interop/node_modules/
+test/opus-ref/
+test/rnnoise-ref/

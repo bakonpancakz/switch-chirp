@@ -98,6 +98,29 @@ const Jitter::Slot* Jitter::pop(Stats* st) {
     return nullptr;
 }
 
+bool soundFrame(const int16_t* pcm, size_t n, int rate, uint64_t* pos, int16_t* out) {
+    if (rate <= 0 || !n) {
+        memset(out, 0, MIXER_FRAME * sizeof(int16_t));
+        return false;
+    }
+    uint64_t step = ((uint64_t)rate << 16) / MIXER_RATE;  // (input samples per output sample, Q16)
+    uint64_t p = *pos;
+    bool more = true;
+    for (size_t i = 0; i < MIXER_FRAME; i++, p += step) {
+        size_t k = (size_t)(p >> 16);
+        if (k >= n) {
+            out[i] = 0;
+            more = false;
+            continue;
+        }
+        int a = pcm[k], b = k + 1 < n ? pcm[k + 1] : 0;
+        int frac = (int)(p & 0xFFFF);
+        out[i] = (int16_t)(a + (((b - a) * frac) >> 16));
+    }
+    *pos = p;
+    return more && (p >> 16) < n;
+}
+
 #ifdef __SWITCH__
 namespace {
 
@@ -127,6 +150,15 @@ struct Tone {
 };
 Tone g_tones[TONES];
 uint64_t g_frames = 0;
+
+// the sound effect playing (sounds.h), under g_lock: the mixer reads it there, so stopSound() leaves
+// pcm free once it returns
+const int16_t* g_sound = nullptr;
+size_t g_sound_n = 0;
+int g_sound_rate = 0;
+uint64_t g_sound_pos = 0;
+int16_t g_sound_frame[MIXER_FRAME];
+constexpr int SOUND_GAIN = MIXER_UNITY;
 
 void toneFrame(int k, int16_t* f) {
     Tone& t = g_tones[k];
@@ -177,20 +209,30 @@ constexpr int SPEAKING_DB = 50;     // louder than -50 dBFS: speaking
 struct Speaker {
     bool used;
     uint64_t user;
+    uint32_t gen;   // (which of the place's speakers this is: a new one each time it's someone new)
     Jitter jitter;
-    int decoder;    // -1: none lent
     uint64_t last_packet_ms, last_sound_ms;
     uint8_t level;  // -dBFS of the last frame (MIXER_SILENT: none)
 };
 
-Mutex g_lock;  // the speakers (the voice thread adds packets, this one plays them)
+// The decoders, lent to speakers. Whose each one is lives here only, under g_lock, and only this
+// thread changes it: a speaker's place given to someone new (the voice thread) just makes the old
+// lending stale (its gen no longer matches). Once, the voice thread freed decoders itself while this
+// thread was lending them, unlocked: two speakers could end up decoding with one decoder's state
+struct Lent {
+    int speaker;  // (-1: free)
+    uint32_t gen;
+};
+
+Mutex g_lock;  // the speakers and the lendings (the voice thread adds packets, this one plays them)
 Speaker g_speakers[MIXER_SPEAKERS];
+uint32_t g_gen = 0;
 volatile bool g_voice = false;
 int (*g_gain)(uint64_t user) = nullptr;
 
 HwopusDecoder g_dec[DECODERS];
-bool g_dec_open[DECODERS];
-int g_dec_speaker[DECODERS];  // (-1: free)
+bool g_dec_open[DECODERS];  // (this thread's alone)
+Lent g_lent[DECODERS];
 int16_t g_pcm[MIXER_FRAME * 2];
 int16_t g_voices[MIXER_SPEAKERS][MIXER_FRAME];
 alignas(16) uint8_t g_packet[8 + MIXER_PACKET_MAX];  // (hwopus's 8-byte header, then the packet: aligned as the slots)
@@ -206,43 +248,50 @@ volatile int g_cushion = MIXER_START_AT;
 
 uint64_t nowMs() { return armTicksToNs(armGetSystemTick()) / 1000000ULL; }
 
-// A decoder for speaker s: a free one, else the one lent longest ago to someone quiet; fresh each time it changes hands
-int lendDecoder(int s) {
-    int pick = -1;
-    for (int d = 0; d < DECODERS && pick < 0; d++)
-        if (g_dec_speaker[d] < 0) pick = d;
-    for (int d = 0; d < DECODERS && pick < 0; d++) {
-        const Speaker& o = g_speakers[g_dec_speaker[d]];
-        if (!o.jitter.playing) pick = d;
-    }
-    if (pick < 0) return -1;  // (everyone's talking: this one waits)
-    // (one that couldn't be opened isn't tried again for a second: not 50 IPC calls a second)
-    static uint64_t retry_ms = 0;
-    if (nowMs() < retry_ms) return -1;
-    if (g_dec_speaker[pick] >= 0) g_speakers[g_dec_speaker[pick]].decoder = -1;
-    if (g_dec_open[pick]) hwopusDecoderExit(&g_dec[pick]);
-    Result rc = hwopusDecoderInitialize(&g_dec[pick], MIXER_RATE, 1);
-    g_dec_open[pick] = R_SUCCEEDED(rc);
+// (under g_lock) Whether decoder d is lent to someone still there (the same speaker, in their place)
+bool lentLive(int d) {
+    const Lent& l = g_lent[d];
+    return l.speaker >= 0 && g_speakers[l.speaker].used && g_speakers[l.speaker].gen == l.gen;
+}
+
+// (under g_lock) The decoder lent to speaker s now, or -1
+int lentTo(int s) {
+    for (int d = 0; d < DECODERS; d++)
+        if (lentLive(d) && g_lent[d].speaker == s) return d;
+    return -1;
+}
+
+// (under g_lock) A decoder to lend speaker s: a free one (or one whose speaker's gone), else the one lent
+// to someone quiet now; -1: everyone's talking, this one waits
+int pickDecoder() {
+    for (int d = 0; d < DECODERS; d++)
+        if (!lentLive(d)) return d;
+    for (int d = 0; d < DECODERS; d++)
+        if (!g_speakers[g_lent[d].speaker].jitter.playing) return d;
+    return -1;
+}
+
+// Decoder d made fresh for its new speaker (it changes hands: no state carried over); false: it
+// couldn't be opened (its lending is given back)
+bool openDecoder(int d) {
+    if (g_dec_open[d]) hwopusDecoderExit(&g_dec[d]);
+    Result rc = hwopusDecoderInitialize(&g_dec[d], MIXER_RATE, 1);
+    g_dec_open[d] = R_SUCCEEDED(rc);
     mutexLock(&g_lock);
-    if (g_dec_open[pick]) g_stats.dec_opened++;
-    else g_stats.dec_failed++, g_stats.last_rc = rc;
+    if (g_dec_open[d]) g_stats.dec_opened++;
+    else g_stats.dec_failed++, g_stats.last_rc = rc, g_lent[d].speaker = -1;
     mutexUnlock(&g_lock);
-    if (!g_dec_open[pick]) {
-        g_dec_speaker[pick] = -1;
-        retry_ms = nowMs() + 1000;
-        return -1;
-    }
-    g_dec_speaker[pick] = s;
-    g_speakers[s].decoder = pick;
-    return pick;
+    return g_dec_open[d];
 }
 
 void closeDecoders() {
     for (int d = 0; d < DECODERS; d++) {
         if (g_dec_open[d]) hwopusDecoderExit(&g_dec[d]);
         g_dec_open[d] = false;
-        g_dec_speaker[d] = -1;
     }
+    mutexLock(&g_lock);
+    for (Lent& l : g_lent) l.speaker = -1;
+    mutexUnlock(&g_lock);
 }
 
 // The next packet speaker s has to play, copied into g_packet (after hwopus's 8-byte header); 0: none
@@ -260,29 +309,36 @@ size_t nextPacket(Speaker& sp) {
 size_t voiceFrame(const int16_t** frames, int* gains) {
     size_t n = 0;
     uint64_t now = nowMs();
+    static uint64_t retry_ms = 0;  // (a decoder that couldn't be opened isn't tried again for a second)
     for (int s = 0; s < MIXER_SPEAKERS; s++) {
         mutexLock(&g_lock);
         Speaker& sp = g_speakers[s];
         size_t len = 0;
+        int d = -1;
+        bool fresh = false;
+        if (sp.used && now - sp.last_packet_ms > SPEAKER_GONE_MS) sp = Speaker{};  // (its lending goes stale with it)
         if (sp.used) {
-            if (now - sp.last_packet_ms > SPEAKER_GONE_MS) {
-                if (sp.decoder >= 0) g_dec_speaker[sp.decoder] = -1;
-                sp = Speaker{};
-            } else {
-                sp.jitter.start_at = g_cushion;
-                sp.jitter.trim_at = g_cushion + (MIXER_TRIM_AT - MIXER_START_AT);
-                len = nextPacket(sp);
-                if (!sp.jitter.playing && sp.decoder >= 0 && now - sp.last_packet_ms > DECODER_IDLE_MS) {
-                    g_dec_speaker[sp.decoder] = -1;
-                    sp.decoder = -1;
-                }
+            sp.jitter.start_at = g_cushion;
+            sp.jitter.trim_at = g_cushion + (MIXER_TRIM_AT - MIXER_START_AT);
+            len = nextPacket(sp);
+            d = lentTo(s);
+            if (d >= 0 && !len && !sp.jitter.playing && now - sp.last_packet_ms > DECODER_IDLE_MS) {
+                g_lent[d].speaker = -1;  // (quiet a while: someone else may have it)
+                d = -1;
+            }
+            if (len && d < 0 && now >= retry_ms && (d = pickDecoder()) >= 0) {
+                g_lent[d] = Lent{s, sp.gen};
+                fresh = true;
             }
         }
         uint64_t user = sp.user;
+        uint32_t gen = sp.gen;
         mutexUnlock(&g_lock);
-        if (!len) continue;
-        int d = sp.decoder >= 0 ? sp.decoder : lendDecoder(s);
-        if (d < 0) continue;
+        if (!len || d < 0) continue;
+        if (fresh && !openDecoder(d)) {
+            retry_ms = now + 1000;
+            continue;
+        }
         s32 used = 0, samples = 0;
         Result rc = hwopusDecodeInterleaved(&g_dec[d], &used, &samples, g_packet, 8 + len, g_pcm, sizeof(g_pcm));
         if (R_FAILED(rc) || samples <= 0) {
@@ -300,19 +356,18 @@ size_t voiceFrame(const int16_t** frames, int* gains) {
         for (size_t i = 0; i < MIXER_FRAME; i++) sum += (uint64_t)((int32_t)g_voices[n][i] * g_voices[n][i]);
         float rms = sqrtf((float)sum / MIXER_FRAME);
         int db = rms < 1.0f ? 255 : (int)(-20.0f * log10f(rms / 32768.0f));
+        int gain = g_deaf ? 0 : ((g_gain ? g_gain(user) : MIXER_UNITY) * g_master) >> 12;
         mutexLock(&g_lock);
-        if (sp.used && sp.user == user) {  // (unless it was replaced meanwhile)
+        if (sp.used && sp.gen == gen) {  // (unless it was someone new meanwhile)
             sp.level = (uint8_t)(db > 255 ? 255 : db < 0 ? 0 : db);
             if (sp.level < SPEAKING_DB) sp.last_sound_ms = now;
         }
         g_stats.decoded++;
         if (db < g_stats.loudest) g_stats.loudest = (uint8_t)(db < 0 ? 0 : db);
+        g_stats.last_gain = gain * 100 / MIXER_UNITY;
         mutexUnlock(&g_lock);
         frames[n] = g_voices[n];
-        gains[n] = g_deaf ? 0 : ((g_gain ? g_gain(user) : MIXER_UNITY) * g_master) >> 12;
-        mutexLock(&g_lock);
-        g_stats.last_gain = gains[n] * 100 / MIXER_UNITY;
-        mutexUnlock(&g_lock);
+        gains[n] = gain;
         n++;
     }
     return n;
@@ -320,8 +375,8 @@ size_t voiceFrame(const int16_t** frames, int* gains) {
 
 // The next 20 ms into b: the call, and the sound check's tones
 void fill(Buf& b) {
-    const int16_t* frames[TONES + MIXER_SPEAKERS];
-    int gains[TONES + MIXER_SPEAKERS];
+    const int16_t* frames[TONES + 1 + MIXER_SPEAKERS];
+    int gains[TONES + 1 + MIXER_SPEAKERS];
     size_t n = 0;
     if (g_check) {
         for (int k = 0; k < TONES; k++) {
@@ -330,6 +385,13 @@ void fill(Buf& b) {
             gains[n++] = g_deaf ? 0 : (TONE_GAIN * g_master) >> 12;
         }
     }
+    mutexLock(&g_lock);
+    if (g_sound) {
+        if (!soundFrame(g_sound, g_sound_n, g_sound_rate, &g_sound_pos, g_sound_frame)) g_sound = nullptr;
+        frames[n] = g_sound_frame;  // (its last frame, the rest silence, still goes)
+        gains[n++] = g_deaf ? 0 : (SOUND_GAIN * g_master) >> 12;
+    }
+    mutexUnlock(&g_lock);
     if (g_voice) {
         size_t v = voiceFrame(frames + n, gains + n);
         if (v) {
@@ -347,7 +409,7 @@ void fill(Buf& b) {
 
 void mixThread(void*) {
     while (g_run) {
-        if (!g_check && !g_voice) {
+        if (!g_check && !g_voice && !soundPlaying()) {
             closeDecoders();
             outClose();
             svcSleepThread(100'000'000LL);
@@ -414,12 +476,11 @@ void voicePacket(uint64_t user, uint16_t seq, const uint8_t* opus, size_t n) {
             sp = &g_speakers[0];
             for (Speaker& s : g_speakers)
                 if (s.last_packet_ms < sp->last_packet_ms) sp = &s;
-            if (sp->decoder >= 0) g_dec_speaker[sp->decoder] = -1;
         }
-        *sp = Speaker{};
+        *sp = Speaker{};  // (whoever had the place: their decoder's lending is stale now, see Lent)
         sp->used = true;
         sp->user = user;
-        sp->decoder = -1;
+        sp->gen = ++g_gen;
         sp->level = MIXER_SILENT;
     }
     sp->last_packet_ms = now;
@@ -438,8 +499,8 @@ void busy(int* speakers, int* decoders, int* speakers_max, int* decoders_max) {
     int s = 0, dc = 0;
     mutexLock(&g_lock);
     for (int i = 0; i < MIXER_SPEAKERS; i++) s += g_speakers[i].used;
+    for (int i = 0; i < DECODERS; i++) dc += lentLive(i);
     mutexUnlock(&g_lock);
-    for (int i = 0; i < DECODERS; i++) dc += g_dec_speaker[i] >= 0;
     *speakers = s, *decoders = dc, *speakers_max = MIXER_SPEAKERS, *decoders_max = DECODERS;
 }
 
@@ -469,7 +530,7 @@ void takeStats(Stats* out) {
 void start() {
     mutexInit(&g_lock);
     resetStats();
-    for (int d = 0; d < DECODERS; d++) g_dec_speaker[d] = -1;
+    for (Lent& l : g_lent) l.speaker = -1;
     g_run = true;
     if (R_FAILED(threadCreate(&g_thread, mixThread, nullptr, nullptr, 0x4000, 0x1C, -2))) {
         g_run = false;
@@ -494,6 +555,26 @@ void setSoundCheck(bool on) {
 }
 
 bool soundCheck() { return g_check; }
+
+void playSound(const int16_t* pcm, size_t n, int rate) {
+    mutexLock(&g_lock);
+    g_sound = n && rate > 0 ? pcm : nullptr;
+    g_sound_n = n, g_sound_rate = rate, g_sound_pos = 0;
+    mutexUnlock(&g_lock);
+}
+
+void stopSound() {
+    mutexLock(&g_lock);
+    g_sound = nullptr;
+    mutexUnlock(&g_lock);
+}
+
+bool soundPlaying() {
+    mutexLock(&g_lock);
+    bool on = g_sound != nullptr;
+    mutexUnlock(&g_lock);
+    return on;
+}
 void setDeaf(bool on) { g_deaf = on; }
 #endif
 

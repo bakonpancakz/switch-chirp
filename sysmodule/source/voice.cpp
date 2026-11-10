@@ -22,6 +22,7 @@
 #include "json.h"
 #include "mic.h"
 #include "screen.h"
+#include "share.h"
 #include "mixer.h"
 #include "rtp.h"
 #include "tls.h"
@@ -76,6 +77,51 @@ RandomFn g_rnd = nullptr;
 
 uint64_t nowMs() { return armTicksToNs(armGetSystemTick()) / 1000000ULL; }
 
+// share::Video's frames: the screen's queue (screen.h)
+struct ScreenFrames : share::Frames {
+    bool take(uint8_t** f, size_t* n, size_t* cap, uint64_t* tick, bool* gap) override { return screen::take(f, n, cap, tick, gap); }
+    void done() override { screen::done(); }
+    uint8_t* borrow(size_t* cap, bool flush) override { return screen::borrowRing(cap, flush); }
+    void giveBack() override { screen::returnRing(); }
+    bool fullRange() override { return screen::fullRange(); }
+} g_frames;
+
+// share::Video's loading screens: *.h264 in CHIRP_LOADING (scripts/loading.ps1 makes them)
+struct CardLoading : share::Loading {
+    // (one pass, each file taking the pick with a chance of 1 in how many so far: all alike in the end.
+    // The SD card's directories can't be rewound (libnx's fsdev), so counting first, then reading again
+    // for the one picked, found nothing the second time: no loading screen, and nothing in the log)
+    bool pick(char* name, size_t cap, const char** why) override {
+        name[0] = 0;
+        DIR* dir = opendir(CHIRP_LOADING);
+        if (!dir) {
+            *why = "no " CHIRP_LOADING " folder";
+            return false;
+        }
+        uint32_t count = 0;
+        while (dirent* e = readdir(dir)) {
+            size_t n = strlen(e->d_name);
+            if (n <= 5 || strcmp(e->d_name + n - 5, ".h264") || n >= cap) continue;
+            count++;
+            uint32_t r = 0;
+            g_rnd(&r, sizeof(r));
+            if (r % count == 0) memcpy(name, e->d_name, n + 1);
+        }
+        closedir(dir);
+        *why = "no loading screens in " CHIRP_LOADING;
+        return name[0] != 0;
+    }
+    long read(const char* name, uint8_t* buf, size_t cap) override {
+        char path[192];
+        snprintf(path, sizeof(path), "%s/%s", CHIRP_LOADING, name);
+        FILE* f = fopen(path, "rb");
+        if (!f) return -1;
+        size_t n = fread(buf, 1, cap, f);
+        fclose(f);
+        return (long)n;
+    }
+} g_loading;
+
 void say(const char* fmt, ...) {
     if (!g_log) return;
     char line[256];
@@ -97,7 +143,7 @@ long toLong(const char* s) { return strtol(s, nullptr, 10); }  // (a float's who
 
 // --- one connection to the voice server ---
 
-class Session : public WsHandler, public JsonHandler, public DaveOut {
+class Session : public WsHandler, public JsonHandler, public DaveOut, public share::Sink {
 public:
     TlsStream tls;
     WebSocket ws;
@@ -107,22 +153,13 @@ public:
     Link* link = nullptr;
     bool stream = false;  // (Go Live's connection: see Link)
     uint32_t asent = 0, aunsent = 0;  // (the game's sound)
-    uint64_t last_frame_ms = 0, next_grey_ms = 0;  // (the grey placeholder: see sendVideo)
-    bool need_idr = false;
-    int grey_id = 0;
-    uint32_t vgrey = 0, vwaited = 0;
-    // (the recorder's blank picture: out of the game (the HOME menu), grc goes on sending a still grey one,
-    // the same keyframe again and again, byte for byte. Three alike: the loading screen instead)
-    size_t last_key_n = 0;
-    int same_keys = 0;
-    bool blank = false;
-    void placeholder(uint64_t now, bool flush);
-    char loading[160] = {0};  // (this time's loading screen: chosen when the game's picture goes)
-    bool sendLoading(uint64_t tick, bool flush);
-    void pickLoading();
+    // the screen's video: what to send (share.h); sendFrame() sends it
+    share::Video video{&g_frames, &g_loading, this};
 
     // where the connection is
     bool identified = false, described = false, acked = true;
+    int unacked = 0;  // (heartbeats in a row with no answer: two, and the connection's taken for dead)
+    bool dead = false;
     uint32_t interval = 0;
     uint64_t next_beat = 0, next_keepalive = 0, next_stats = 0, next_limits = 0;
     int64_t seq = -1;
@@ -135,7 +172,7 @@ public:
     uint32_t vts = 0;
     uint64_t vstart = 0;
     bool video_on = false;  // (announced as active: op 12)
-    uint32_t vsent = 0, vframes = 0, vdropped = 0, vbytes = 0, vkeys = 0;
+    uint32_t vsent = 0, vbytes = 0;  // (video packets sent, and their bytes)
     uint32_t nacks = 0, plis = 0;  // (viewers' RTCP: lost packets to send again, keyframes wanted)
     RtpMode mode = Rtp_None;
     uint8_t key[RTP_KEY];
@@ -173,7 +210,9 @@ public:
     void binary(uint8_t o, const uint8_t* body, size_t n) override { ws.sendBinary(o, body, n); }
     uint8_t* scratch(size_t* cap) override;  // (g_bin: see DaveOut)
     void json(const char* t) override { ws.sendText(t, strlen(t)); }
-    void log(const char* line) override { say("%s", line); }
+    void log(const char* line) override { say("%s", line); }  // (DaveOut's and share::Sink's)
+    // share::Sink
+    bool send(uint8_t* f, size_t n, size_t cap, uint64_t tick) override { return sendFrame(f, n, cap, tick); }
 
     // WsHandler
     void messageStart(bool is_text) override {
@@ -202,9 +241,14 @@ public:
         }
     }
     void messageEnd() override {
-        mutexLock(&g_mls);
+        // (g_mls only for what hands work to DAVE: its binary messages, and the text ones about the
+        // group. Held for every message, Ready's IP discovery (up to 5 s of waiting on UDP) kept the
+        // other connection's DAVE waiting too, and a newcomer's sound couldn't be opened meanwhile)
+        bool mls = !text || op == Op_SessionDescription || op == Op_ClientsConnect || op == Op_ClientDisconnect ||
+                   op >= DaveOp_PrepareTransition;
+        if (mls) mutexLock(&g_mls);
         handle();
-        mutexUnlock(&g_mls);
+        if (mls) mutexUnlock(&g_mls);
     }
     void handle();
 
@@ -250,8 +294,7 @@ public:
     void heartbeat(uint64_t now);
     void udpPackets(uint64_t now);
     void sendAudio();
-    bool sendVideo(uint64_t now);  // (true: a frame went, another may be waiting)
-    void sendFrame(uint8_t* frame, size_t n, size_t cap, uint64_t tick);
+    bool sendFrame(uint8_t* frame, size_t n, size_t cap, uint64_t tick);  // (false: it didn't all get out)
     void sendGameAudio();
     void announceVideo(bool on);
     void closeUdp() {
@@ -345,7 +388,19 @@ bool Session::ready() {
 }
 
 void Session::heartbeat(uint64_t now) {
-    if (!acked) say("voice: the last heartbeat wasn't answered");
+    if (!acked) {
+        say("voice: the last heartbeat wasn't answered");
+        // (a connection gone quiet without closing: the call went silent and stayed so. Over: the thread
+        // connects again, as the gateway does)
+        if (++unacked >= 2) {
+            say("voice: no answer to two heartbeats: connecting again");
+            ws.sendClose(1000);
+            dead = true;
+            return;
+        }
+    } else {
+        unacked = 0;
+    }
     acked = false;
     beat_sent = now;
     sendJson("{\"op\":3,\"d\":{\"t\":%llu,\"seq_ack\":%lld}}", (unsigned long long)now, (long long)seq);
@@ -506,13 +561,10 @@ void Session::announceVideo(bool on) {
 
 // A frame (Annex-B, in a buffer of cap bytes): DAVE-encrypted in place, cut into H.264 RTP payloads,
 // each sealed and sent. (The socket's send buffer is small: when it's full, a moment's wait for room; a
-// frame that can't get through is given up on)
-void Session::sendFrame(uint8_t* frame, size_t n, size_t cap, uint64_t tick) {
+// frame that can't get through is given up on: false)
+bool Session::sendFrame(uint8_t* frame, size_t n, size_t cap, uint64_t tick) {
     size_t out_n = 0;
-    if (!dave.encryptVideo(frame, n, cap, &out_n)) {
-        vdropped++;
-        return;
-    }
+    if (!dave.encryptVideo(frame, n, cap, &out_n)) return false;
     uint32_t ts = vts + (uint32_t)(armTicksToNs(tick - vstart) * 9 / 100000);  // (90 kHz)
     static uint8_t scratch[1100], pkt[1100 + RTP_OVERHEAD];
     bool gave_up = false;
@@ -544,143 +596,7 @@ void Session::sendFrame(uint8_t* frame, size_t n, size_t cap, uint64_t tick) {
         vsent++;
         vbytes += (uint32_t)m;
     });
-    // (a frame only partly sent breaks the ones after it as a dropped one does: they wait for a keyframe)
-    if (gave_up) vdropped++, need_idr = true;
-    else vframes++;
-}
-
-// One of the loading screens (CHIRP_LOADING), at random, for this time the game's picture is gone
-void Session::pickLoading() {
-    loading[0] = 0;
-    DIR* dir = opendir(CHIRP_LOADING);
-    if (!dir) {
-        say("screen: nothing to show, and no %s folder: grey", CHIRP_LOADING);
-        return;
-    }
-    auto isFrame = [](const char* name) {
-        size_t n = strlen(name);
-        return n > 5 && !strcmp(name + n - 5, ".h264");
-    };
-    // (one pass, each file taking the pick with a chance of 1 in how many so far: all alike in the end.
-    // The SD card's directories can't be rewound (libnx's fsdev), so counting first, then reading again
-    // for the one picked, found nothing the second time: no loading screen, and nothing in the log)
-    uint32_t count = 0;
-    while (dirent* e = readdir(dir)) {
-        if (!isFrame(e->d_name)) continue;
-        count++;
-        uint32_t r = 0;
-        g_rnd(&r, sizeof(r));
-        if (r % count == 0) snprintf(loading, sizeof(loading), "%s/%s", CHIRP_LOADING, e->d_name);
-    }
-    closedir(dir);
-    if (!count) say("screen: nothing to show, and no loading screens in %s: grey", CHIRP_LOADING);
-    if (loading[0]) say("screen: nothing to show: loading screen %s", loading + strlen(CHIRP_LOADING) + 1);
-}
-
-// The chosen loading screen, read into the (empty) send queue and sent from there; false: none, or it
-// couldn't be (too big, unreadable, frames came meanwhile)
-bool Session::sendLoading(uint64_t tick, bool flush) {
-    if (!loading[0]) return false;
-    size_t cap = 0;
-    uint8_t* buf = screen::borrowRing(&cap, flush);
-    if (!buf) return false;  // (frames came meanwhile: the game's back)
-    const char* why = nullptr;
-    constexpr size_t MAX = 200 * 1024;
-    if (FILE* f = fopen(loading, "rb")) {
-        size_t n = fread(buf, 1, MAX + 1, f);
-        fclose(f);
-        // (its SPS made as WebRTC wants it, as the recorder's are; its own ids (1), kept apart from those)
-        static H264Params own;
-        bool idr = false;
-        if (n <= 4) why = "empty";
-        else if (n > MAX) why = "over 200 KB";
-        else if ((n = rtpH264WithParams(buf, n, cap - 1024, &own, &idr)), !idr) why = "not a keyframe";
-        else sendFrame(buf, n, cap, tick);
-    } else {
-        why = "couldn't be opened";
-    }
-    screen::returnRing();
-    if (why) {
-        say("screen: loading screen %s %s: grey instead", loading + strlen(CHIRP_LOADING) + 1, why);
-        loading[0] = 0;  // (grey from now on, this time)
-    }
-    return !why;
-}
-
-// Nothing of the game's to show: a loading screen (or grey), again every 2 s for viewers who come later.
-// flush: the recorder's frames queued meanwhile are thrown away (its blank picture), so the queue's free
-void Session::placeholder(uint64_t now, bool flush) {
-    static H264Params own;  // (grey's: grc's SPS, as the frames it stands in for)
-    static uint8_t grey[H264_PLACEHOLDER_MAX + 1024];  // (room for DAVE's trailer)
-    if (now < next_grey_ms) return;
-    own.full_range = screen::fullRange() ? 1 : 0;
-    if (!next_grey_ms) pickLoading();  // (a new time without the game's picture)
-    size_t g = 0;
-    if (sendLoading(armGetSystemTick(), flush)) {
-        vgrey++;
-        need_idr = true;
-    } else if ((g = h264Placeholder(&own, grey_id++, grey, H264_PLACEHOLDER_MAX)) != 0) {
-        sendFrame(grey, g, sizeof(grey), armGetSystemTick());
-        vgrey++;
-        need_idr = true;
-    }
-    next_grey_ms = now + 2000;
-}
-
-// The recorder's next frame; with none for a while (no game, the HOME menu), a grey keyframe, again every
-// 2 s for viewers who come later. After a grey one the recorder's frames wait for its next keyframe:
-// the ones between refer to pictures the viewers no longer have
-bool Session::sendVideo(uint64_t now) {
-    static H264Params params;  // (keyframes carry the SPS and PPS: see rtp.h)
-    uint8_t* frame;
-    size_t n, cap;
-    uint64_t tick;
-    bool gap = false;
-    if (!screen::take(&frame, &n, &cap, &tick, &gap)) {
-        if (now - last_frame_ms >= 700) placeholder(now, false);
-        return false;
-    }
-    last_frame_ms = now;
-    bool idr = false;
-    params.full_range = screen::fullRange() ? 1 : 0;
-    n = rtpH264WithParams(frame, n, cap - 1024, &params, &idr);
-    // (the recorder's blank picture: the same keyframe again and again, back to back, nothing between. A
-    // game whose picture only holds still (a pause menu, a dialogue box) sends keyframes alike too, but
-    // with ordinary frames between them: counted alike only one after another, it once took those for
-    // blank and put the loading screen up after three alike (6-9 s with a 180-frame GOP). Out of it at the
-    // first keyframe that differs, or the first ordinary frame: the game's running)
-    if (idr) {
-        same_keys = n == last_key_n ? same_keys + 1 : 0;
-        last_key_n = n;
-    } else {
-        same_keys = 0, last_key_n = 0;
-    }
-    if (!blank && same_keys >= 2) {
-        blank = true;
-        say("screen: the recorder's sending a still, blank picture (out of the game?): the loading screen instead (%u-byte keyframes)",
-            (unsigned)n);
-    } else if (blank && same_keys == 0) {
-        blank = false;
-        need_idr = true;  // (an ordinary frame first: it refers to pictures the viewers never got)
-        say("screen: the game's picture is back");
-    }
-    if (blank) {
-        screen::done();
-        placeholder(now, true);
-        return true;
-    }
-    next_grey_ms = 0;
-    if (gap) need_idr = true;  // (frames were dropped before this one: wait for a picture that stands alone)
-    if (need_idr && !idr) {
-        vwaited++;
-        screen::done();
-        return true;
-    }
-    need_idr = false;
-    if (idr) vkeys++;
-    sendFrame(frame, n, cap, tick);
-    screen::done();
-    return true;
+    return !gave_up;
 }
 
 void Session::udpPackets(uint64_t now) {
@@ -710,10 +626,11 @@ void Session::udpPackets(uint64_t now) {
             unknown++;
             continue;
         }
+        // (this connection's own keys, on its own thread, as its DAVE messages are handled: not under
+        // g_mls, which is for the MLS work's shared buffers. Under it, every voice waited while the other
+        // connection worked through a commit or a Welcome, and the mixer ran dry)
         size_t fn = 0;
-        mutexLock(&g_mls);
         bool ok = dave.decrypt(user, p.payload, p.payload_n, frame, &fn, now);
-        mutexUnlock(&g_mls);
         if (!ok) {
             undecrypted++;
             continue;
@@ -747,13 +664,10 @@ uint16_t runSession(Link& L, uint32_t serial) {
     s.bin = L.bin;
     s.asent = s.aunsent = 0;
     s.cpu_at = 0;
-    s.last_frame_ms = nowMs();
-    s.next_grey_ms = 0;
-    s.need_idr = false;
-    s.vgrey = s.vwaited = 0;
-    s.last_key_n = 0, s.same_keys = 0, s.blank = false;
+    s.video.reset(nowMs());
     s.identified = s.described = false;
     s.acked = true;
+    s.unacked = 0, s.dead = false;
     s.seq = -1;
     s.interval = 0;
     s.map_n = 0;
@@ -769,7 +683,7 @@ uint16_t runSession(Link& L, uint32_t serial) {
     mutexUnlock(&g_mls);
     s.vssrc = s.vrtx = 0;
     s.video_on = false;
-    s.vsent = s.vframes = s.vdropped = s.vbytes = s.vkeys = s.nacks = s.plis = 0;
+    s.vsent = s.vbytes = s.nacks = s.plis = 0;
     g_rnd(&s.vseq, sizeof(s.vseq));
     g_rnd(&s.vts, sizeof(s.vts));
     s.vstart = armGetSystemTick();
@@ -807,7 +721,7 @@ uint16_t runSession(Link& L, uint32_t serial) {
         // (while the mic records, a packet is ready every 20 ms: looked for every 5)
         poll(p, s.udp >= 0 ? 2 : 1, s.tls.pending() ? 1 : (mic::active() || screen::active()) ? 5 : WAIT_MS);
         now = nowMs();
-        alive = s.ws.poll(0, &s);
+        alive = s.ws.poll(0, &s) && !s.dead;
         if (s.udp >= 0) s.udpPackets(now);
         if (s.udp >= 0 && s.described && s.mode != Rtp_None) {
             if (!s.stream) {
@@ -818,7 +732,7 @@ uint16_t runSession(Link& L, uint32_t serial) {
                 bool on = screen::active();
                 if (on != s.video_on) s.announceVideo(on);
                 // (frames queued behind a keyframe: a few at once, the sound between)
-                for (int k = 0; on && k < 4 && s.sendVideo(now); k++) s.sendGameAudio();
+                for (int k = 0; on && k < 4 && s.video.step(now, armGetSystemTick()); k++) s.sendGameAudio();
                 s.sendGameAudio();
             }
         }
@@ -844,16 +758,17 @@ uint16_t runSession(Link& L, uint32_t serial) {
                 "their timestamps %llu..%llu apart", sc.skipped, sc.no_room, sc.waited_ms, (unsigned long long)sc.gap_min,
                 (unsigned long long)sc.gap_max);
             // (in three lines: one, longer than a log line's 256 bytes, lost its end)
+            share::Video::Stats vs;
+            s.video.takeStats(&vs);
             say("screen: %s, %u frames captured, %u sent (%u keyframes) in %u packets (%u KB), %u not sent; %u loading screens "
-                "or grey; %u skipped waiting for a keyframe", sc.no_game ? "waiting for a game" : sc.open ? "capturing" : "not capturing", sc.captured, s.vframes,
-                s.vkeys, s.vsent, s.vbytes / 1024, s.vdropped, s.vgrey, s.vwaited);
+                "or grey; %u skipped waiting for a keyframe", sc.no_game ? "waiting for a title that records" : sc.open ? "capturing" : "not capturing",
+                sc.captured, vs.sent, vs.keyframes, s.vsent, s.vbytes / 1024, vs.failed, vs.placeholders, vs.waited);
             say("screen: grc:d %u failures (0x%X); its longest wait for a frame %u ms (waiting now: %u ms), for sound %u ms (now: "
                 "%u ms); %u sound chunks read", sc.failed, sc.last_rc, sc.video_longest_ms, sc.video_waiting_ms, sc.audio_longest_ms,
                 sc.audio_waiting_ms, sc.audio_chunks);
             say("screen: viewers asked %u times for lost packets, %u for keyframes; game sound: %u packets sent (%u not), %u dropped "
                 "waiting, %u gaps", s.nacks, s.plis, s.asent, s.aunsent, sc.audio_dropped, sc.audio_holes);
-            s.vgrey = s.vwaited = 0;
-            s.vsent = s.vframes = s.vdropped = s.vbytes = s.vkeys = s.nacks = s.plis = 0;
+            s.vsent = s.vbytes = s.nacks = s.plis = 0;
             s.asent = s.aunsent = 0;
             s.next_stats = now + STATS_MS;
         }

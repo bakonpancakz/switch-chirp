@@ -15,7 +15,8 @@
 #define CHIRP_LOG CHIRP_DIR "/chirp.log"
 #define CHIRP_PEOPLE_INI CHIRP_DIR "/people.ini"  // our mute and volume for people (store.h)
 #define CHIRP_LOADING CHIRP_DIR "/loading"  // *.h264: keyframes shown while sharing and the game shows nothing (scripts/loading.ps1)
-#define CHIRP_AVATARS CHIRP_DIR "/avatars"  // {ChirpMember.avatar}.png, fetched by the sysmodule
+#define CHIRP_AVATARS CHIRP_DIR "/avatars"
+#define CHIRP_SOUNDS CHIRP_DIR "/sounds"  // voice_join.wav, voice_leave.wav, screenshare_join.wav, screenshare_leave.wav (sounds.h)  // {ChirpMember.avatar}.png, fetched by the sysmodule
 
 // A name as it's kept and shown: UTF-8, cut (with "…") to fit, NUL-terminated
 #define CHIRP_NAME 48

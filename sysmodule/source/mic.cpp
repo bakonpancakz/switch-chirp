@@ -117,7 +117,7 @@ volatile bool g_speaking = false;
 volatile uint8_t g_level = MIC_SILENT;
 
 OpusEnc g_enc;
-Denoiser g_dn;  // (RNNoise: 12 KB of state)
+Denoiser g_dn;  // (RNNoise v0.2: 25 KB of state)
 HighPass g_hp;
 Detector g_det;
 int16_t g_frame[OPUSENC_FRAME];   // (filling from audin)

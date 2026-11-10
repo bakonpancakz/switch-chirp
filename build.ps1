@@ -44,6 +44,10 @@ Set-Content -Encoding ascii (Join-Path $sys "toolbox.json") '{"name": "Chirp", "
 Write-Host "the sysmodule is in $sys ($((Get-Item (Join-Path $sys 'exefs.nsp')).LastWriteTime))"
 # the loading screens (loading/*.png, encoded once each: see scripts/loading.ps1)
 & (Join-Path $PSScriptRoot "scripts\loading.ps1") -Root $PSScriptRoot
+# the call's sounds (sounds/*.wav: joining and leaving, yours and other people's; swap them as you like)
+$snd = Join-Path $PSScriptRoot "dist\config\sys-chirp\sounds"
+New-Item -ItemType Directory -Force $snd | Out-Null
+Copy-Item (Join-Path $PSScriptRoot "sounds\*.wav") $snd
 if ($Target -eq "sysmodule") { exit 0 }
 Invoke-Make "overlay" ""
 

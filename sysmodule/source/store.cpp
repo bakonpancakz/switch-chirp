@@ -230,6 +230,12 @@ void memberSet(int guild_slot, uint64_t user, uint64_t channel, uint8_t flags, c
     changed();
 }
 
+uint64_t memberChannel(int guild_slot, uint64_t user) {
+    for (const Member& m : g_members)
+        if (m.used && m.guild == guild_slot && m.user == user) return m.channel;
+    return 0;
+}
+
 void memberName(int guild_slot, uint64_t user, const char* name, size_t n, const char* avatar) {
     if (n == 0) return;
     for (Member& m : g_members) {

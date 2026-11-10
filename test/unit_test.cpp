@@ -16,6 +16,10 @@
 #include "store.h"
 #include "util.h"
 #include "ws.h"
+#include "framequeue.h"
+#include "screenclock.h"
+#include "share.h"
+#include "sounds.h"
 
 static int g_fail = 0, g_pass = 0;
 #define CHECK(c)                                                       \
@@ -447,6 +451,16 @@ static void testInCallAlready() {
     pump(ws, gw, srv, 10);
     CHECK(gw.callChannel() == 102 && gw.callGuild() == 10 && gw.selfMute());
     CHECK(!strcmp(gw.voiceSession(), "mine"));
+    // someone else into our channel and out of it: counted (the call's sounds); elsewhere: not
+    CHECK(gw.othersJoined() == 0 && gw.othersLeft() == 0);
+    srv.message("{\"t\":\"VOICE_STATE_UPDATE\",\"s\":4,\"op\":0,\"d\":{\"user_id\":\"501\",\"guild_id\":\"10\",\"channel_id\":\"102\",\"session_id\":\"x\"}}");
+    srv.message("{\"t\":\"VOICE_STATE_UPDATE\",\"s\":5,\"op\":0,\"d\":{\"user_id\":\"501\",\"guild_id\":\"10\",\"channel_id\":\"102\",\"self_mute\":true,\"session_id\":\"x\"}}");
+    srv.message("{\"t\":\"VOICE_STATE_UPDATE\",\"s\":6,\"op\":0,\"d\":{\"user_id\":\"502\",\"guild_id\":\"10\",\"channel_id\":\"103\",\"session_id\":\"y\"}}");
+    pump(ws, gw, srv, 10);
+    CHECK(gw.othersJoined() == 1 && gw.othersLeft() == 0);  // (muting isn't joining again; another channel isn't ours)
+    srv.message("{\"t\":\"VOICE_STATE_UPDATE\",\"s\":7,\"op\":0,\"d\":{\"user_id\":\"501\",\"guild_id\":\"10\",\"channel_id\":null,\"session_id\":\"x\"}}");
+    pump(ws, gw, srv, 10);
+    CHECK(gw.othersJoined() == 1 && gw.othersLeft() == 1);
     // and Leave can say which guild
     CHECK(gw.voiceState(gw.callGuild(), 0, false, false));
     CHECK(srv.sent().back().second == "{\"op\":4,\"d\":{\"guild_id\":\"10\",\"channel_id\":null,\"self_mute\":false,\"self_deaf\":false,\"self_video\":false}}");
@@ -471,6 +485,20 @@ static void testInCallAlready() {
     srv.message("{\"t\":\"STREAM_SERVER_UPDATE\",\"s\":5,\"op\":0,\"d\":{\"token\":\"tok\",\"stream_key\":\"guild:10:102:900\",\"guild_id\":null,\"endpoint\":\"c-x.discord.media:2087\"}}");
     pump(ws, gw, srv, 20);
     CHECK(gw.streamServer() == 555 && !strcmp(gw.streamToken(), "tok") && !strcmp(gw.streamEndpoint(), "c-x.discord.media:2087"));
+    // who's watching: STREAM_UPDATE's viewer_ids, each one coming and going counted; someone else's stream
+    // isn't ours; an update without the list changes nothing; an empty one is everyone gone
+    CHECK(gw.streamViewers() == 0 && gw.viewersJoined() == 0);
+    srv.message("{\"t\":\"STREAM_UPDATE\",\"s\":51,\"op\":0,\"d\":{\"stream_key\":\"guild:10:102:900\",\"viewer_ids\":[\"7\",\"8\"],\"paused\":false}}");
+    srv.message("{\"t\":\"STREAM_UPDATE\",\"s\":52,\"op\":0,\"d\":{\"stream_key\":\"guild:10:102:901\",\"viewer_ids\":[\"9\"],\"paused\":false}}");
+    pump(ws, gw, srv, 21);
+    CHECK(gw.streamViewers() == 2 && gw.viewersJoined() == 2 && gw.viewersLeft() == 0);
+    srv.message("{\"t\":\"STREAM_UPDATE\",\"s\":53,\"op\":0,\"d\":{\"stream_key\":\"guild:10:102:900\",\"viewer_ids\":[\"8\"],\"paused\":false}}");
+    srv.message("{\"t\":\"STREAM_UPDATE\",\"s\":54,\"op\":0,\"d\":{\"stream_key\":\"guild:10:102:900\",\"paused\":true}}");
+    pump(ws, gw, srv, 22);
+    CHECK(gw.streamViewers() == 1 && gw.viewersJoined() == 2 && gw.viewersLeft() == 1);
+    srv.message("{\"t\":\"STREAM_UPDATE\",\"s\":55,\"op\":0,\"d\":{\"stream_key\":\"guild:10:102:900\",\"viewer_ids\":[],\"paused\":false}}");
+    pump(ws, gw, srv, 23);
+    CHECK(gw.streamViewers() == 0 && gw.viewersLeft() == 2);
     srv.message("{\"t\":\"STREAM_DELETE\",\"s\":6,\"op\":0,\"d\":{\"stream_key\":\"guild:10:102:900\",\"reason\":\"user_requested\",\"unavailable\":false}}");
     pump(ws, gw, srv, 30);
     CHECK(gw.streamServer() == 0 && !gw.streamEndpoint()[0]);
@@ -494,6 +522,12 @@ static void testInCallAlready() {
         "\"session_id\":\"elsewhere\"}}");
     pump(ws, gw, srv, 60);
     CHECK(gw.callChannel() == 0 && gw.callGuild() == 0);
+    // a voice server named; a new session forgets it (its token was the old session's: using it was turned down)
+    srv.message("{\"t\":\"VOICE_SERVER_UPDATE\",\"s\":10,\"op\":0,\"d\":{\"token\":\"old\",\"guild_id\":\"10\",\"endpoint\":\"c-x.discord.media:443\"}}");
+    pump(ws, gw, srv, 70);
+    CHECK(!strcmp(gw.voiceEndpoint(), "c-x.discord.media:443") && gw.voiceServerGuild() == 10);
+    gw.start(&ws, "x", rnd, logLine, 80);
+    CHECK(!gw.voiceEndpoint()[0] && !gw.voiceToken()[0] && gw.voiceServerGuild() == 0 && !gw.voiceSession()[0]);
 }
 
 // Guilds in full inside READY (as a sharded bot may get them), and a stub that waits for its GUILD_CREATE
@@ -739,6 +773,356 @@ static void testStore() {
     CHECK(store::guildBegin() == -1 && store::dropped().guilds == 1);
 }
 
+// The screen share's send queue (framequeue.h): frames whole in the ring, room after the newest or back
+// at the start, one held at a time, one of its own memory blocking room until it's gone
+static void testFrameQueue() {
+    static uint8_t ring[1000], own[50];
+    FrameQueue q;
+    q.init(ring, sizeof(ring));
+    FrameQueue::Frame f;
+    CHECK(q.empty() && !q.take(&f));
+    CHECK(q.room(1001) == nullptr);  // (bigger than the ring: never)
+    uint8_t* a = q.room(400);
+    CHECK(a == ring);
+    q.push(a, 300, 400, 11, false);
+    uint8_t* b = q.room(400);
+    CHECK(b == ring + 400);
+    q.push(b, 350, 400, 22, true);
+    CHECK(q.room(400) == nullptr);  // (200 left after, none before the first)
+    CHECK(q.take(&f) && f.p == ring && f.n == 300 && f.tick == 11 && !f.gap);
+    CHECK(!q.take(&f));  // (one at a time)
+    q.done();
+    CHECK(q.room(400) == ring);  // (the first's gone: room at the start again)
+    q.push(ring, 10, 400, 33, false);
+    CHECK(q.take(&f) && f.p == ring + 400 && f.gap);
+    q.done();
+    CHECK(q.take(&f) && f.tick == 33);
+    q.done();
+    CHECK(q.empty());
+    // one of its own memory: no room in the ring until it's sent
+    q.push(own, 50, sizeof(own), 44, false);
+    CHECK(q.room(10) == nullptr);
+    CHECK(q.take(&f) && f.p == own);
+    q.done();
+    CHECK(q.room(10) == ring);
+    // dropped: what's queued goes, but not one the reader holds
+    q.push(q.room(100), 100, 100, 1, false);
+    q.push(q.room(100), 100, 100, 2, false);
+    CHECK(q.take(&f));
+    q.drop();
+    CHECK(!q.empty());
+    q.done();
+    q.drop();
+    CHECK(q.empty());
+    // all the slots full: no room, however much ring is left
+    for (uint32_t i = 0; i < FrameQueue::SLOTS; i++) q.push(q.room(10), 10, 10, i, false);
+    CHECK(q.room(10) == nullptr);
+}
+
+// The recorder's clocks (screenclock.h)
+static void testScreenClocks() {
+    VideoClock v;
+    uint64_t gap = 0;
+    // the first frame: set on our clock at once; then frames 16.7 ms apart follow the recorder's own times
+    CHECK(v.recorded(1'000'000, 5'000'000'000ULL) == 5'000'000'000ULL);
+    CHECK(v.missed(1'000'000, &gap) == 0 && gap == 0);
+    CHECK(v.recorded(1'016'667, 5'020'000'000ULL) == 5'016'667'000ULL);  // (read 3 ms late: still its own time)
+    CHECK(v.missed(1'016'667, &gap) == 0 && gap == 16667);
+    CHECK(v.missed(1'033'334, &gap) == 0);
+    // three frames' time: two missed
+    CHECK(v.missed(1'083'335, &gap) == 2 && gap == 50001);
+    // a step shorter than a frame (the recorder catching up) isn't taken as the frame time
+    CHECK(v.missed(1'083'335 + 5000, &gap) == 0);
+    CHECK(v.missed(1'083'335 + 5000 + 16667, &gap) == 0);
+    // drifted over half a second: set again from now
+    CHECK(v.recorded(1'200'000, 9'000'000'000ULL) == 9'000'000'000ULL);
+    // after a reset, the next is the first again
+    v.reset();
+    CHECK(v.missed(2'000'000, &gap) == 0 && gap == 0);
+
+    AudioClock a;
+    // chunks of 1024 samples, 21333 us apart: the timestamps are microseconds; nothing to fill
+    uint64_t ts = 10'000'000;
+    for (int i = 0; i < 4; i++, ts += 21333) {
+        AudioClock::Place p = a.place(ts, 1024);
+        CHECK(!p.hole && !p.silence && !p.skip);
+    }
+    // one chunk missed (read too late): its samples are filled with silence
+    ts += 21333;
+    AudioClock::Place p = a.place(ts, 1024);
+    CHECK(p.hole && p.silence >= 1020 && p.silence <= 1030 && !p.skip);
+    // a long hole (the HOME menu, 2 s): the packets move on instead
+    ts += 21333 + 2'000'000;
+    p = a.place(ts, 1024);
+    CHECK(p.hole && !p.silence && p.skip > 90000);
+    // the clock going back over a second: begun again, no hole
+    p = a.place(ts - 3'000'000, 1024);
+    CHECK(!p.hole);
+    p = a.place(ts - 3'000'000 + 21333, 1024);
+    CHECK(!p.hole && !p.silence);
+}
+
+// share::Video's stand-ins: frames handed out in order, loading screens, and a sink that records
+struct FakeFrames : share::Frames {
+    struct F {
+        std::vector<uint8_t> bytes;
+        bool gap;
+    };
+    std::vector<F> waiting;
+    uint8_t buf[8192];
+    uint8_t ring[8192];
+    bool lent = false, full = false;
+    bool take(uint8_t** f, size_t* n, size_t* cap, uint64_t* tick, bool* gap) override {
+        if (waiting.empty()) return false;
+        memcpy(buf, waiting[0].bytes.data(), waiting[0].bytes.size());
+        *f = buf, *n = waiting[0].bytes.size(), *cap = sizeof(buf), *tick = 0, *gap = waiting[0].gap;
+        return true;
+    }
+    void done() override { waiting.erase(waiting.begin()); }
+    uint8_t* borrow(size_t* cap, bool flush) override {
+        if (flush) waiting.clear();
+        if (!waiting.empty()) return nullptr;
+        lent = true;
+        *cap = sizeof(ring);
+        return ring;
+    }
+    void giveBack() override { lent = false; }
+    bool fullRange() override { return full; }
+};
+
+struct FakeLoading : share::Loading {
+    bool have = true;
+    std::vector<uint8_t> file;
+    bool pick(char* name, size_t cap, const char** why) override {
+        if (!have) {
+            *why = "none here";
+            return false;
+        }
+        snprintf(name, cap, "miku.h264");
+        return true;
+    }
+    long read(const char*, uint8_t* buf, size_t cap) override {
+        size_t n = file.size() < cap ? file.size() : cap;
+        memcpy(buf, file.data(), n);
+        return (long)n;
+    }
+};
+
+struct FakeSink : share::Sink {
+    struct Sent {
+        int nal;  // (the type of the last NAL: 5 a keyframe's slice, 1 another's)
+        bool keyframe;
+        size_t n;
+    };
+    std::vector<Sent> sent;
+    std::vector<std::string> lines;
+    bool fail_next = false;
+    bool send(uint8_t* f, size_t n, size_t, uint64_t) override {
+        Sent s = {0, false, n};
+        for (size_t i = 0; i + 3 < n; i++)
+            if (f[i] == 0 && f[i + 1] == 0 && f[i + 2] == 1) {
+                s.nal = f[i + 3] & 0x1f;
+                if (s.nal == 5) s.keyframe = true;
+            }
+        sent.push_back(s);
+        if (fail_next) {
+            fail_next = false;
+            return false;
+        }
+        return true;
+    }
+    void log(const char* line) override { lines.push_back(line); }
+    bool said(const char* what) const {
+        for (auto& l : lines)
+            if (l.find(what) != std::string::npos) return true;
+        return false;
+    }
+};
+
+static std::vector<uint8_t> h264Frame(bool idr, uint8_t fill, size_t body = 40) {
+    std::vector<uint8_t> f = {0, 0, 0, 1, (uint8_t)(idr ? 0x65 : 0x41), 0x88};
+    for (size_t i = 0; i < body; i++) f.push_back((uint8_t)(fill + i) | 0x10);  // (no start codes inside)
+    return f;
+}
+
+static void testShareVideo() {
+    FakeFrames frames;
+    FakeLoading loading;
+    FakeSink sink;
+    share::Video v(&frames, &loading, &sink);
+    uint64_t now = 1000;
+    v.reset(now);
+    auto push = [&](bool idr, uint8_t fill, bool gap = false, size_t body = 40) { frames.waiting.push_back({h264Frame(idr, fill, body), gap}); };
+    auto run = [&]() {
+        while (v.step(now, 0)) {
+        }
+    };
+
+    // the game's frames go as they come; a keyframe with the SPS and PPS put in front
+    push(true, 1), push(false, 2), push(false, 3);
+    run();
+    CHECK(sink.sent.size() == 3 && sink.sent[0].keyframe && !sink.sent[1].keyframe);
+    CHECK(sink.sent[0].n > h264Frame(true, 1).size());  // (the parameter sets went in front)
+    share::Video::Stats st;
+    v.takeStats(&st);
+    CHECK(st.sent == 3 && st.keyframes == 1 && st.waited == 0);
+
+    // frames lost before one: the ones after wait for a keyframe
+    sink.sent.clear();
+    push(false, 4, true), push(false, 5), push(true, 6), push(false, 7);
+    run();
+    CHECK(sink.sent.size() == 2 && sink.sent[0].keyframe);
+    v.takeStats(&st);
+    CHECK(st.waited == 2);
+
+    // one that didn't all get out breaks the ones after it the same way
+    sink.sent.clear();
+    sink.fail_next = true;
+    push(false, 8), push(false, 9), push(true, 10);
+    run();
+    CHECK(sink.sent.size() == 2 && sink.sent[1].keyframe);
+    v.takeStats(&st);
+    CHECK(st.failed == 1 && st.waited == 1);
+
+    // no frames for a while: the loading screen, again every 2 s, not in between
+    sink.sent.clear();
+    loading.file = h264Frame(true, 0x40, 300);
+    now += 699;
+    v.step(now, 0);
+    CHECK(sink.sent.empty());
+    now += 1;
+    v.step(now, 0);
+    CHECK(sink.sent.size() == 1 && sink.sent[0].keyframe && sink.said("loading screen miku.h264"));
+    now += 1000;
+    v.step(now, 0);
+    CHECK(sink.sent.size() == 1);
+    now += 1000;
+    v.step(now, 0);
+    CHECK(sink.sent.size() == 2 && !frames.lent);
+    // the game's back: its frames wait for its keyframe (viewers have the loading screen's picture)
+    sink.sent.clear();
+    push(false, 11), push(true, 12);
+    run();
+    CHECK(sink.sent.size() == 1 && sink.sent[0].keyframe);
+
+    // a loading screen that isn't a keyframe: grey instead, and grey for the rest of this time
+    sink.sent.clear();
+    sink.lines.clear();
+    loading.file = h264Frame(false, 0x40, 300);
+    now += 5000;
+    v.step(now, 0);
+    CHECK(sink.sent.size() == 1 && sink.sent[0].keyframe && sink.said("isn't a keyframe: grey instead"));
+    // none on the card: grey
+    push(true, 13);
+    run();
+    sink.sent.clear();
+    sink.lines.clear();
+    loading.have = false;
+    now += 5000;
+    v.step(now, 0);
+    CHECK(sink.sent.size() == 1 && sink.sent[0].keyframe && sink.said("none here: grey"));
+    loading.have = true;
+    loading.file = h264Frame(true, 0x40, 300);
+
+    // a game holding still: keyframes alike, but ordinary frames between: never taken for blank
+    sink.sent.clear();
+    sink.lines.clear();
+    for (int i = 0; i < 5; i++) push(true, 20), push(false, (uint8_t)(21 + i));
+    run();
+    // (keyframes alike either side of a time with no frames (the loading screen meanwhile) aren't back to
+    // back either: the keyframe before it, 13, is the size of these)
+    CHECK(sink.sent.size() == 10 && !sink.said("blank picture"));
+
+    // the recorder's blank picture: the same keyframe back to back. The third: the loading screen, the
+    // queued frames thrown away
+    sink.sent.clear();
+    push(true, 30), push(true, 30), push(true, 30);
+    run();
+    CHECK(sink.said("blank picture"));
+    CHECK(sink.sent.size() == 3 && sink.sent[2].n != sink.sent[0].n);  // (two keyframes, then the loading screen in place of the third)
+    // still blank: nothing of the recorder's goes
+    push(true, 30), push(true, 30);
+    run();
+    CHECK(sink.sent.size() == 3);
+    // an ordinary frame: the game's back; it waits for a keyframe, which goes
+    push(false, 31), push(true, 32), push(false, 33);
+    run();
+    CHECK(sink.said("picture is back") && sink.sent.size() == 5 && sink.sent[3].keyframe && !sink.sent[4].keyframe);
+}
+
+// The call's sounds (sounds.h): WAV headers read, stereo mixed down, a cut one faded; and the mixer's
+// resampling to 48 kHz
+static std::vector<uint8_t> wavBytes(uint16_t format, uint16_t channels, uint32_t rate, uint16_t bits, const std::vector<int16_t>& samples,
+                                     bool extra_chunk = false) {
+    std::vector<uint8_t> w;
+    auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; i++) w.push_back((uint8_t)(v >> (8 * i))); };
+    auto u16 = [&](uint16_t v) { w.push_back((uint8_t)v), w.push_back((uint8_t)(v >> 8)); };
+    auto tag = [&](const char* t) { w.insert(w.end(), t, t + 4); };
+    tag("RIFF"), u32(0), tag("WAVE");
+    if (extra_chunk) tag("LIST"), u32(3), w.push_back('a'), w.push_back('b'), w.push_back('c'), w.push_back(0);  // (odd: padded)
+    tag("fmt ");
+    if (format == 0xFFFE) {
+        u32(40), u16(format), u16(channels), u32(rate), u32(rate * channels * 2), u16((uint16_t)(channels * 2)), u16(bits);
+        u16(22), u16(bits), u32(0), u16(1);  // (cbSize, valid bits, channel mask, the sub-format's first two bytes: PCM)
+        for (int i = 0; i < 14; i++) w.push_back(0);
+    } else {
+        u32(16), u16(format), u16(channels), u32(rate), u32(rate * channels * 2), u16((uint16_t)(channels * 2)), u16(bits);
+    }
+    tag("data"), u32((uint32_t)(samples.size() * 2));
+    for (int16_t v : samples) u16((uint16_t)v);
+    return w;
+}
+
+static void testSounds() {
+    sounds::WavInfo w;
+    // the default chime, as it ships
+    FILE* f = fopen("../sounds/voice_join.wav", "rb");
+    CHECK(f != nullptr);
+    if (f) {
+        uint8_t head[4096];
+        size_t n = fread(head, 1, sizeof(head), f);
+        fclose(f);
+        CHECK(sounds::wavInfo(head, n, &w) && w.rate == 24000 && w.channels == 1 && w.data_at == 44 && w.data_bytes / 2 <= SOUNDS_MAX);
+    }
+    // stereo, with a chunk before its samples (padded to an even size): found, mixed to mono
+    auto st = wavBytes(1, 2, 48000, 16, {1000, 3000, -2000, -4000, 32767, 32767}, true);
+    CHECK(sounds::wavInfo(st.data(), st.size(), &w) && w.channels == 2 && w.rate == 48000 && w.data_bytes == 12);
+    int16_t mono[3];
+    sounds::toMono(st.data() + w.data_at, 3, 2, mono);
+    CHECK(mono[0] == 2000 && mono[1] == -3000 && mono[2] == 32767);
+    // "extensible" PCM is PCM; 8-bit, float, three channels and 96 kHz aren't played
+    auto ext = wavBytes(0xFFFE, 1, 16000, 16, {1, 2});
+    CHECK(sounds::wavInfo(ext.data(), ext.size(), &w) && w.rate == 16000 && w.data_bytes == 4);
+    auto b8 = wavBytes(1, 1, 24000, 8, {1});
+    CHECK(!sounds::wavInfo(b8.data(), b8.size(), &w));
+    auto fl = wavBytes(3, 1, 24000, 16, {1});
+    CHECK(!sounds::wavInfo(fl.data(), fl.size(), &w));
+    auto three = wavBytes(1, 3, 24000, 16, {1, 2, 3});
+    CHECK(!sounds::wavInfo(three.data(), three.size(), &w));
+    auto fast = wavBytes(1, 1, 96000, 16, {1});
+    CHECK(!sounds::wavInfo(fast.data(), fast.size(), &w));
+    const uint8_t junk[] = "RIFX....WAVEfmt ";
+    CHECK(!sounds::wavInfo(junk, sizeof(junk), &w));
+    // a cut sound's end faded to nothing, the rest as it was
+    std::vector<int16_t> loud(1000, 10000);
+    sounds::fadeOut(loud.data(), loud.size(), 24000, 10);  // (10 ms: 240 samples)
+    CHECK(loud[759] == 10000 && loud[760] < 10000 && loud[999] == 0 && loud[880] > 4000 && loud[880] < 6000);
+
+    // 24 kHz to 48: every other output sample between two inputs; then it runs out
+    std::vector<int16_t> ramp(600);
+    for (size_t i = 0; i < ramp.size(); i++) ramp[i] = (int16_t)(i * 10);
+    int16_t out[MIXER_FRAME];
+    uint64_t pos = 0;
+    CHECK(mixer::soundFrame(ramp.data(), ramp.size(), 24000, &pos, out));
+    CHECK(out[0] == 0 && out[1] == 5 && out[2] == 10 && out[3] == 15 && out[958] == 4790);
+    CHECK(!mixer::soundFrame(ramp.data(), ramp.size(), 24000, &pos, out));  // (600 at 24 kHz: 1200 at 48, 1.25 frames)
+    CHECK(out[0] == 4800 && out[239] != 0 && out[240] == 0 && out[959] == 0);
+    // 48 kHz plays as it is
+    pos = 0;
+    std::vector<int16_t> same(2000, 123);
+    CHECK(mixer::soundFrame(same.data(), same.size(), 48000, &pos, out) && out[0] == 123 && out[959] == 123);
+}
+
 int main() {
     srand(1234);
     testUtil();
@@ -752,6 +1136,10 @@ int main() {
     testJitter();
     testDetector();
     testStore();
+    testFrameQueue();
+    testScreenClocks();
+    testShareVideo();
+    testSounds();
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

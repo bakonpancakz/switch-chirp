@@ -1,11 +1,11 @@
-// Screen sharing: the game's video as the system records it (grc:d, the
-// service SysDVR uses), already H.264, a frame at a time: 1280x720, 30 a second.
-// Its own thread reads a frame into the one buffer there is, and hands it to the
-// voice connection (which owns the DAVE and RTP state: it encrypts, packetizes
-// and sends it), then reads the next once that's done. Only while wanted (the
-// overlay's Share Screen) and in a call whose voice server gave a video stream.
-// With Go Live, the stream's own connection (voice.h) sends it, and the game's
-// sound too: read on its own thread, mixed to mono, encoded to Opus here.
+// Screen sharing's capture: the game's video as the system records it (grc:d, the service SysDVR uses),
+// already H.264, a frame at a time (1280x720, 30 or 60 a second), and its sound. Only while wanted (the
+// overlay's Screenshare), in a call whose voice server gave a video stream, and (video) while a game runs.
+//  - Video: its thread reads a frame into the one buffer there is, copies it into the send queue
+//    (framequeue.h), and reads the next; the recorder's timestamps say when it was recorded and whether
+//    frames were missed (screenclock.h). The Go Live connection (voice.cpp) takes them from the queue,
+//    and share.h decides what's sent.
+//  - Sound: its own thread reads it, mixes it to mono, and encodes it to Opus here, 20 ms a packet.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -27,6 +27,10 @@ void setFullRange(bool on);
 bool fullRange();
 bool wanted();
 void setCall(bool on);    // the voice connection can send video
+// The title running (0: none) and whether it lets the system record video (its control data's
+// VideoCapture: 0 no, 1 on request, 2 always; -1 not read yet): video is asked of grc:d only while one
+// that allows it runs (app.cpp says, each second)
+void setTitle(uint64_t title, int video_capture);
 bool active();            // capturing
 
 // The next frame, if one's ready: Annex-B H.264 in a buffer of *cap bytes (it may be changed in place),
@@ -48,7 +52,9 @@ bool takeAudio(AudioPacket* p);
 // The send queue's memory, lent while it's empty (a loading screen is read into it and sent from it):
 // null if frames are waiting (flush: they're thrown away first, as when the recorder's sending only a
 // blank picture). Capture waits meanwhile. returnRing() when done, from the same thread
-uint8_t* borrowRing(size_t* cap, bool flush = false);
+// wait: false, null at once if it's lent or being written to right now (game.h's name lookup, which
+// the network thread makes holding its lock, and tries again later)
+uint8_t* borrowRing(size_t* cap, bool flush = false, bool wait = true);
 void returnRing();
 
 struct Stats {
@@ -64,7 +70,7 @@ struct Stats {
     // how long the one going on now has been waiting (0: none), video's and sound's; sound chunks read
     uint32_t video_longest_ms, video_waiting_ms, audio_longest_ms, audio_waiting_ms;
     uint32_t audio_chunks;
-    bool no_game;  // (no game running now: video isn't asked for until one is)
+    bool no_game;  // (no title that records running now: video isn't asked for until one is)
     bool open;
 };
 void takeStats(Stats* out);

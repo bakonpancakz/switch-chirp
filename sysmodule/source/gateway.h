@@ -21,6 +21,7 @@
 
 #define GATEWAY_INTENTS ((1 << 0) | (1 << 7))  // GUILDS, GUILD_VOICE_STATES
 #define GATEWAY_NAMES 64  // member names one GUILD_CREATE can bring for its voice states
+#define GATEWAY_VIEWERS 32  // our stream's viewers followed (each one's coming and going: the call's sounds)
 
 class Gateway : public WsHandler, public JsonHandler {
 public:
@@ -56,6 +57,11 @@ public:
     uint32_t streamSerial() const { return stream_serial_; }
     // Goes up each time Discord ends our stream itself (not our own streamDelete): refused, or ended for us
     uint32_t streamEnded() const { return stream_ended_; }
+    // Our stream's viewers (STREAM_CREATE's and STREAM_UPDATE's viewer_ids): how many watch now, and each
+    // one coming and going (each goes up by one each time)
+    size_t streamViewers() const { return viewers_n_; }
+    uint32_t viewersJoined() const { return viewers_joined_; }
+    uint32_t viewersLeft() const { return viewers_left_; }
     void close();  // (ends the session: a new one starts from scratch)
 
     bool ready() const { return ready_; }
@@ -71,6 +77,10 @@ public:
     uint64_t callGuild() const { return call_guild_; }
     uint64_t callChannel() const { return call_channel_; }
     uint64_t callSinceMs() const { return call_since_ms_; }
+    // Other people coming into our call's channel, and going out of it (as it happens: not the voice
+    // states a session starts with); each goes up by one each time (the call's sounds, sounds.h)
+    uint32_t othersJoined() const { return others_joined_; }
+    uint32_t othersLeft() const { return others_left_; }
     bool selfMute() const { return self_mute_; }
     bool selfDeaf() const { return self_deaf_; }
     // For the voice connection: the bot's voice session (its VOICE_STATE_UPDATE), and the voice
@@ -168,6 +178,7 @@ private:
     char my_name_[CHIRP_NAME];
     char session_id_[64] = {0};  // (READY's: the bot's voice states with it are this session's call)
     uint64_t call_guild_ = 0, call_channel_ = 0, call_since_ms_ = 0;
+    uint32_t others_joined_ = 0, others_left_ = 0;
     bool self_mute_ = false, self_deaf_ = false;
     char voice_session_[64] = {0}, voice_token_[96] = {0}, voice_endpoint_[128] = {0};
     char server_token_[96], server_endpoint_[128];  // (a VOICE_SERVER_UPDATE while it's read)
@@ -181,6 +192,12 @@ private:
     char stream_active_[80] = {0};  // (ours, asked for and not ended by us: empty, none)
     uint32_t stream_ended_ = 0;
     uint64_t stream_rtc_ = 0, stream_rtc_channel_ = 0;
+    uint64_t viewers_[GATEWAY_VIEWERS];  // (watching our stream now)
+    size_t viewers_n_ = 0;
+    uint32_t viewers_joined_ = 0, viewers_left_ = 0;
+    uint64_t msg_viewers_[GATEWAY_VIEWERS];  // (the message being read's viewer_ids, if it has them)
+    size_t msg_viewers_n_ = 0;
+    bool msg_viewers_listed_ = false;
     void streamKey(uint64_t guild, uint64_t channel, char out[80]) const;
     void streamClear();
 

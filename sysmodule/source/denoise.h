@@ -1,33 +1,37 @@
-// Noise suppression, by hand, with RNNoise's trained model (rnn_weights.h; Jean-Marc
-// Valin's "A Hybrid DSP/Deep Learning Approach to Real-Time Full-Band Speech
-// Enhancement", xiph rnnoise v0.1). Every 10 ms: the spectrum (a 960-point FFT
-// over 20 ms, windowed), 22 bands' energies, their cepstrum and its deltas, the
-// pitch and how well each band follows it: 42 numbers, into three GRUs. Out come
-// a gain per band (the noise taken down, speech left) and how likely it is that
-// someone's talking. The pitch harmonics are reinforced, the gains applied, and
-// the spectrum turned back into sound. 10 ms of delay.
-// (v0.2's larger models, tried and set aside in extras/denoise-v0.2: they cost
-// 1.3-3 MB more and did no better at what mattered, clothes rubbing on the mic.)
-// Checked on the PC against xiph's own code (test/denoise_test.cpp).
+// Noise suppression, by hand, with RNNoise v0.2's trained model (rnn_weights2.h;
+// xiph rnnoise 0.2, Jean-Marc Valin). Every 10 ms: the spectrum (a 960-point
+// FFT over 20 ms, windowed), 32 ERB bands' energies and their cepstrum, the
+// pitch and how well each band follows it: 65 numbers, through two 1-D
+// convolutions (the last 3 frames) and three 384-wide GRUs (int8 weights,
+// block-sparse). Out come a gain per band and how likely it is that someone's
+// talking. The pitch harmonics are reinforced, the gains applied, and the
+// spectrum turned back into sound, a frame later than it came (the model looks
+// one frame ahead): 20 ms of delay in all.
+// The matrix products are written with GCC's vector types: NEON on the Switch,
+// SSE on the PC, the same code either way, so the PC tests check what runs on
+// the Switch (test/denoise_test.cpp, against xiph's own C code).
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
 
 #define DENOISE_FRAME 480  // 10 ms at 48 kHz
-#define DENOISE_BANDS 22
+#define DENOISE_BANDS 32
 #define DENOISE_PITCH_BUF (768 + 960)
-#define DENOISE_DELAY 1    // frames the output comes behind the input (the overlap)
+#define DENOISE_DELAY 2    // frames the output comes behind the input (the overlap, and the look-ahead)
 
 struct Denoiser {
-    float analysis[DENOISE_FRAME];  // the last frame (the window's first half)
-    float synthesis[DENOISE_FRAME]; // the last output's overlap
+    float analysis[DENOISE_FRAME];   // the last frame (the window's first half)
+    float synthesis[DENOISE_FRAME];  // the last output's overlap
     float pitch_buf[DENOISE_PITCH_BUF];
-    float ceps[8][DENOISE_BANDS];   // the last 8 frames' cepstra
-    int ceps_at;
     float last_gain;
     int last_period;
-    float hp[2];                    // the high-pass filter's memory
-    float vad_state[24], noise_state[48], denoise_state[96];
+    float hp[2];  // the high-pass filter's memory
+    float lastg[DENOISE_BANDS];
+    float conv1[65 * 2], conv2[128 * 2];  // the convolutions' last two frames
+    float gru1[384], gru2[384], gru3[384];
+    // the last frame's spectrum, waiting for this frame's gains (the model's look-ahead)
+    float dX[2 * 481], dP[2 * 481];
+    float dEx[DENOISE_BANDS], dEp[DENOISE_BANDS], dExp[DENOISE_BANDS];
 };
 
 void denoiseInit(Denoiser* d);

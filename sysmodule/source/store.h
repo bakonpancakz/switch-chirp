@@ -67,6 +67,8 @@ const Channel* channelFind(uint64_t id);
 // channel 0: they left voice (in this guild). name null: keep the name and
 // avatar known (a voice state without its member). avatar: a file name, "" for none.
 void memberSet(int guild_slot, uint64_t user, uint64_t channel, uint8_t flags, const char* name, size_t n, const char* avatar);
+// The voice channel someone's in, in that guild (0: none, or not known)
+uint64_t memberChannel(int guild_slot, uint64_t user);
 // A name and avatar for someone in voice who has none yet (GUILD_CREATE's members)
 void memberName(int guild_slot, uint64_t user, const char* name, size_t n, const char* avatar);
 

@@ -81,6 +81,11 @@ bool TlsStream::open(const char* host, char* why, size_t why_cap, const char* po
         close();
         return false;
     }
+    // (the handshake happens on a blocking socket: with no time limit, a server that took the connection
+    // and then went quiet left this thread waiting for ever, "Connecting" with no retry)
+    timeval tv = {TLS_CONNECT_MS / 1000, 0};
+    setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     rc = sslConnectionSetHostName(&conn_, host, (u32)strlen(host));
     if (R_SUCCEEDED(rc)) rc = sslConnectionDoHandshake(&conn_, nullptr, nullptr, nullptr, 0);
     if (R_FAILED(rc)) {

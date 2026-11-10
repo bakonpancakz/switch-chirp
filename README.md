@@ -36,7 +36,7 @@ and can share the game, picture and sound, as a Go Live stream.
   followed, four heard at once), mixed and played through audout (100 ms
   queued).
 - **Talking:** the default mic (a headset's) at 48 kHz, the input volume,
-  noise suppression (RNNoise v0.1, if on), a 100 Hz high-pass for rumble, then the input sensitivity decides if it's
+  noise suppression (RNNoise v0.2, its full model, if on; 10 ms more delay), a 100 Hz high-pass for rumble, then the input sensitivity decides if it's
   talk: two 20 ms frames in a row over the line (so a click or a button press
   never opens the mic, and the first frame still goes out). Then automatic
   gain (if on) and Chirp's own Opus encoder (64 kbps). It only sends while
@@ -80,6 +80,7 @@ username.
    | `switch/.overlays/chirp.ovl` | the overlay |
    | `config/sys-chirp/token.example.txt` | where the token goes |
    | `config/sys-chirp/loading/*.h264` | loading screens for Screenshare (if you made any) |
+   | `config/sys-chirp/sounds/*.wav` | the call's sounds (`voice_*`, `screenshare_*`) |
 
 3. In `sdmc:/config/sys-chirp/`, make **`token.ini`** with a line for each bot:
    `My Bot=<token>`. The overlay's Select Login picks between them, and
@@ -89,8 +90,11 @@ username.
    show your bot, **Connected**.
 
 The token only lives in `token.txt` on your SD card. Chirp's log
-(`config/sys-chirp/chirp.log`) never has it. The log is opened and closed for
-each line, so FTP can copy it while Chirp runs.
+(`config/sys-chirp/chirp.log`) never has it. Lines are queued in memory and
+written by a thread of their own a moment later, so nothing waits on the SD
+card (the call's sound did, once). The file is opened and closed for each
+batch, so FTP can copy it while Chirp runs. Settings and volumes are saved a
+second after their last change.
 
 ## When something's wrong
 
@@ -116,15 +120,44 @@ sharing and the game shows nothing, Chirp sends one of them at random, again
 every 2 s, a new pick each time. They're read from the SD card when needed,
 so they cost no memory.
 
+## Sounds
+
+Chirp plays short sounds for what happens in the call. They're WAVs in
+`config/sys-chirp/sounds/`:
+
+| File | When |
+| --- | --- |
+| `voice_join.wav` | you join a call, or someone comes into your channel |
+| `voice_leave.wav` | you leave it, or someone goes out of it |
+| `screenshare_join.wav` | someone starts watching your screen share |
+| `screenshare_leave.wav` | someone stops watching it |
+
+The log also says how many are watching.
+
+Swap any of them for your own: 16-bit PCM WAV, mono or stereo, 8 to 48 kHz.
+They're mixed to mono and played at your volume, not while you're deafened.
+Each is read from the card when it plays, into one 48 KB buffer: up to 1 s at
+24 kHz, 0.5 s at 48 kHz. Anything longer is cut with a short fade. Delete one
+to silence it. The ones that come with Chirp are in the spirit of the old
+Skype, soft like a bubble bath: deep, watery "bloops" in a small room. They
+rise for a join and fall for a leave, and are made by `scripts/chimes.py`.
+The call's are two quick bubbles; the screen share's are three, deeper and
+slower. `python scripts/chimes.py
+bells` makes the plain bell chimes instead.
+
 ## How it's made
 
 Everything the sysmodule keeps is in fixed tables and buffers. Nothing is
 allocated as it runs, so its memory is known at build time
-(`aarch64-none-elf-size chirp.elf`), about 2.7 MB in all:
+(`aarch64-none-elf-size chirp.elf`), about 5.8 MB in all. That needs more room than stock
+Atmosphère gives sysmodules on firmware 20 to 22 (7 MB extra on 21+, shared by all of them; on
+22.5.0, 1 MB was left in a game before v0.2). Firmware 23.0.0+ with Atmosphère 1.12.1 gives 40 MB.
+On 22.x, raise `ExtraSystemMemoryForAtmosphere_21_0_0` in mesosphere's
+`kern_k_system_control.cpp` (14 MB works; the browser applets get that much less):
 
 | | |
 | --- | --- |
-| code and constants (RNNoise's weights are ~85 KB of it) | ~500 KB |
+| code and constants (RNNoise v0.2's weights are 3.2 MB of it) | ~3.6 MB |
 | grc:d's buffer (its biggest keyframe) and the queue of frames being sent (enough for 8 Mbps) | 600 KB |
 | two voice connections (the call's and the stream's): DAVE's MLS state and room for a Welcome each | ~380 KB |
 | the lists (`store.cpp`), the mixer, the mic | ~200 KB |
@@ -137,6 +170,19 @@ allocated as it runs, so its memory is known at build time
 - **The voice connection** (`voice.cpp`): voice gateway v8, UDP with IP
   discovery, RTP with AES-256-GCM (`rtp.cpp`). Go Live is a second one, to the
   stream's own server.
+- **Screenshare** comes in three parts.
+  - **Capture** (`screen.cpp`) reads grc:d. Video is asked for only while a
+    title runs that allows video capture: a game, or sphaira and whatever
+    runs in it. It also waits a couple of seconds after the title opens. A
+    request made while nothing records is never answered, and was stuck
+    until a restart.
+  - **The send queue** (`framequeue.cpp`) and **the recorder's clocks**
+    (`screenclock.cpp`) sit between capture and sending. The clocks track
+    frames missed and holes in the sound.
+  - **What's sent** (`share.cpp`) decides frame by frame: the game's frames,
+    waits for a keyframe after a loss, and loading screens or grey when
+    there's no picture. `voice.cpp` only encrypts and sends what it's given.
+    The queue, clocks and decisions are tested on a PC with stand-ins.
 - **DAVE** (`dave.cpp`, `mlsgroup.cpp`, `ratchet.cpp`, `p256.cpp`...): MLS
   1.0 with P-256, written out and checked against another MLS library (ts-mls) and the
   MLS test vectors. Video frames are encrypted as libdave does, the H.264

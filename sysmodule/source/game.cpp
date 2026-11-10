@@ -21,17 +21,21 @@ uint64_t running() {
     return tid;
 }
 
-bool name(uint64_t program_id, char* out, size_t cap) {
+bool name(uint64_t program_id, char* out, size_t cap, int* video_capture) {
     out[0] = 0;
+    if (video_capture) *video_capture = -1;
     size_t room = 0;
-    uint8_t* buf = screen::borrowRing(&room);
+    uint8_t* buf = screen::borrowRing(&room, false, false);  // (not waiting: asked again later)
     if (!buf) return false;
     bool ok = false;
     if (room >= sizeof(NsApplicationControlData) && R_SUCCEEDED(nsInitialize())) {
         auto* data = (NsApplicationControlData*)buf;
         u64 got = 0;
         if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, program_id, data, sizeof(*data), &got)) &&
-            got >= sizeof(NacpStruct) && data->nacp.titles_data_format == 0) {
+            got >= sizeof(NacpStruct)) {
+            if (video_capture) *video_capture = data->nacp.video_capture;
+        }
+        if (got >= sizeof(NacpStruct) && data->nacp.titles_data_format == 0) {
             // (English first, else the first language it has a name in. A game made for 21.0.0+ may keep its
             // names DEFLATE-compressed, titles_data_format 1: there's no inflate here, so it isn't named)
             const NacpLanguageEntry* pick = nullptr;

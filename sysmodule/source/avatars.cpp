@@ -36,6 +36,16 @@ Want g_queue[QUEUE];
 int g_head = 0, g_count = 0;
 uint64_t g_seen[SEEN];
 int g_seen_next = 0;
+// (pictures that didn't come: asked for again only after a while. Once, a failure was never tried again
+// until Chirp restarted, the picture stayed a letter all session; and the overlay asks every poll)
+constexpr int FAILED = 16;
+constexpr uint64_t RETRY_MS = 60'000;
+struct Failed {
+    uint64_t hash, until_ms;
+} g_failed[FAILED];
+int g_failed_next = 0;
+
+uint64_t nowMs() { return armTicksToNs(armGetSystemTick()) / 1000000ULL; }
 
 uint64_t fnv(const char* s) {
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -184,8 +194,15 @@ void thread(void*) {
         char why[96] = {0};
         if (!fetch(w, why, sizeof(why))) {
             char line[160];
-            snprintf(line, sizeof(line), "an avatar didn't come: %s", why);
+            snprintf(line, sizeof(line), "an avatar didn't come: %s (asked for again in a minute)", why);
             app::log(line);
+            uint64_t h = fnv(w.file);
+            mutexLock(&g_lock);
+            for (uint64_t& s : g_seen)
+                if (s == h) s = 0;
+            g_failed[g_failed_next] = Failed{h, nowMs() + RETRY_MS};
+            g_failed_next = (g_failed_next + 1) % FAILED;
+            mutexUnlock(&g_lock);
         }
     }
 }
@@ -219,6 +236,8 @@ void want(uint64_t user, uint64_t guild, const char* file) {
     mutexLock(&g_lock);
     bool seen = false;
     for (uint64_t s : g_seen) seen = seen || s == h;
+    uint64_t now = nowMs();
+    for (const Failed& f : g_failed) seen = seen || (f.hash == h && now < f.until_ms);
     if (!seen && g_count < QUEUE) {
         g_seen[g_seen_next] = h;
         g_seen_next = (g_seen_next + 1) % SEEN;

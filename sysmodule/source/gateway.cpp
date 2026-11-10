@@ -49,6 +49,11 @@ void Gateway::start(WebSocket* ws, const char* token, WebSocket::RandomFn rnd, L
     my_name_[0] = 0;
     session_id_[0] = 0;
     voice_session_[0] = 0;
+    // (the last session's voice server too: kept, a reconnect's call tried it with the old token before
+    // the new VOICE_SERVER_UPDATE came, was turned down, and was marked failed for a moment)
+    memset(voice_token_, 0, sizeof(voice_token_));
+    voice_endpoint_[0] = 0;
+    voice_server_guild_ = 0;
     call_guild_ = call_channel_ = call_since_ms_ = 0;
     self_mute_ = self_deaf_ = false;
     streamClear();
@@ -58,6 +63,7 @@ void Gateway::start(WebSocket* ws, const char* token, WebSocket::RandomFn rnd, L
 void Gateway::streamClear() {
     stream_server_ = stream_channel_ = 0;
     stream_active_[0] = 0;
+    viewers_n_ = 0;  // (a new stream has nobody watching yet)
     memset(stream_token_, 0, sizeof(stream_token_));
     stream_endpoint_[0] = 0;
     stream_serial_++;
@@ -311,6 +317,7 @@ void Gateway::begin(const char* path, bool array) {
         }
         return;
     }
+    if (ev_ == Ev_StreamCreate && array && is(path, "d.viewer_ids")) msg_viewers_listed_ = true;  // (even an empty one: everyone left)
     if (ev_ == Ev_GuildCreate && !array) {
         if (is(path, "d.channels[]")) chan_ = ChannelRead{};
         else if (is(path, "d.voice_states[]")) voice_ = VoiceRead{};
@@ -433,7 +440,10 @@ void Gateway::value(const char* path, JsonType type, const char* s, size_t n, bo
         else if (is(s, "STREAM_SERVER_UPDATE")) ev_ = Ev_StreamServer;
         else if (is(s, "STREAM_DELETE")) ev_ = Ev_StreamDelete;
         else ev_ = Ev_Other;
-        if (ev_ >= Ev_StreamCreate) stream_key_[0] = 0, stream_rtc_ = stream_rtc_channel_ = 0, server_token_[0] = server_endpoint_[0] = 0;
+        if (ev_ >= Ev_StreamCreate) {
+            stream_key_[0] = 0, stream_rtc_ = stream_rtc_channel_ = 0, server_token_[0] = server_endpoint_[0] = 0;
+            msg_viewers_n_ = 0, msg_viewers_listed_ = false;
+        }
         return;
     }
     const char* d = under(path, "d");
@@ -480,6 +490,10 @@ void Gateway::value(const char* path, JsonType type, const char* s, size_t n, bo
             if (is(d, "stream_key")) snprintf(stream_key_, sizeof(stream_key_), "%.*s", len, s);
             else if (is(d, "rtc_server_id")) stream_rtc_ = idOf(type, s, n);
             else if (is(d, "rtc_channel_id")) stream_rtc_channel_ = idOf(type, s, n);
+            else if (is(d, "viewer_ids[]")) {
+                uint64_t id = idOf(type, s, n);
+                if (id && msg_viewers_n_ < GATEWAY_VIEWERS) msg_viewers_[msg_viewers_n_++] = id;
+            }
             else if (is(d, "token")) snprintf(server_token_, sizeof(server_token_), "%.*s", len, s);
             else if (is(d, "endpoint")) snprintf(server_endpoint_, sizeof(server_endpoint_), "%.*s", len, s);
             else if (is(d, "reason") && ev_ == Ev_StreamDelete) say("Discord ended the stream: %.*s", len, s);
@@ -506,6 +520,12 @@ void Gateway::commitVoice(int guild_slot) {
     const Text* name = voice_.names.best();
     char avatar[CHIRP_AVATAR];
     voice_.names.avatarFile(avatar);
+    // (someone else into or out of our call's channel, as it happens: VOICE_STATE_UPDATE, not GUILD_CREATE's list)
+    if (ev_ == Ev_VoiceState && voice_.user != me_ && call_channel_) {
+        uint64_t was = store::memberChannel(guild_slot, voice_.user);
+        if (was != call_channel_ && voice_.channel == call_channel_) others_joined_++;
+        else if (was == call_channel_ && voice_.channel != call_channel_) others_left_++;
+    }
     store::memberSet(guild_slot, voice_.user, voice_.channel, voice_.flags, name ? name->s : nullptr, name ? name->n : 0, avatar);
     if (voice_.user != me_ || me_ == 0) return;
     // (inside a GUILD_CREATE the guild's id may not be in its slot yet)
@@ -632,6 +652,21 @@ void Gateway::end(const char* path, bool array) {
                 if (stream_active_[0] && !strcmp(stream_key_, stream_active_)) stream_ended_++;
                 streamClear();
             } else if (ev_ == Ev_StreamCreate) {
+                // who's watching (STREAM_UPDATE says again whenever it changes): each one new, and each gone
+                if (msg_viewers_listed_) {
+                    auto in = [](const uint64_t* list, size_t n, uint64_t id) {
+                        for (size_t i = 0; i < n; i++)
+                            if (list[i] == id) return true;
+                        return false;
+                    };
+                    uint32_t came = 0, went = 0;
+                    for (size_t i = 0; i < msg_viewers_n_; i++) came += !in(viewers_, viewers_n_, msg_viewers_[i]);
+                    for (size_t i = 0; i < viewers_n_; i++) went += !in(msg_viewers_, msg_viewers_n_, viewers_[i]);
+                    viewers_joined_ += came, viewers_left_ += went;
+                    memcpy(viewers_, msg_viewers_, msg_viewers_n_ * sizeof(uint64_t));
+                    viewers_n_ = msg_viewers_n_;
+                    if (came || went) say("the stream's viewers: %u watching", (unsigned)viewers_n_);
+                }
                 if (stream_rtc_ && stream_rtc_ != stream_server_) {
                     stream_server_ = stream_rtc_;
                     stream_channel_ = stream_rtc_channel_;

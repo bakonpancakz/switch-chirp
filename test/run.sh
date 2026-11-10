@@ -8,7 +8,7 @@ mkdir -p out
 S=../sysmodule/source
 CXX="g++ -O1 -g -Wall -std=c++17 -I../common -I$S"
 CRYPTO="$S/sha256.cpp $S/aes.cpp $S/chacha.cpp $S/p256.cpp $S/hpke.cpp"
-$CXX -o out/unit_test.exe unit_test.cpp $S/util.cpp $S/json.cpp $S/ws.cpp $S/store.cpp $S/gateway.cpp $S/mixer.cpp $S/mic.cpp
+$CXX -o out/unit_test.exe unit_test.cpp $S/util.cpp $S/json.cpp $S/ws.cpp $S/store.cpp $S/gateway.cpp $S/mixer.cpp $S/mic.cpp $S/framequeue.cpp $S/screenclock.cpp $S/share.cpp $S/sounds.cpp $S/rtp.cpp $S/aes.cpp $S/chacha.cpp $S/sha256.cpp
 ./out/unit_test.exe
 node crypto_vectors.js
 $CXX -o out/crypto_test.exe crypto_test.cpp $S/daveframe.cpp $S/rtp.cpp $S/mlscrypto.cpp $S/mlskeys.cpp $S/mlswire.cpp $CRYPTO
@@ -26,12 +26,18 @@ if [ -f $O/libopus.a ] && [ -f opus-ref/glue/mdct_ref.o ]; then
     $CXX -O2 -I$O/include -o out/opus_test.exe opus_test.cpp $S/opusenc.cpp $S/fft.cpp opus-ref/glue/mdct_ref.o $O/libopus.a
     ./out/opus_test.exe | grep -E "MDCT|speed|passed|FAIL"
 fi
-# The noise suppression against xiph's RNNoise v0.1 (in rnnoise-ref/: its source, built into
-# build/librnnoise.a: each of src/{denoise,rnn,rnn_data,pitch,celt_lpc,kiss_fft}.c with gcc -O2).
-# (extras/denoise-v0.2 has the larger models' code, and how its references were built)
-if [ -f rnnoise-ref/build/librnnoise.a ]; then
-    $CXX -O2 -Wno-psabi -o out/denoise_test.exe denoise_test.cpp $S/denoise.cpp $S/fft.cpp rnnoise-ref/build/librnnoise.a
+# The noise suppression against xiph's RNNoise v0.2 (in rnnoise-ref/v0.2: the 0.2 release, its own
+# model, built into build3/librnnoise3.a: each of src/{denoise,rnn,nnet,nnet_default,rnnoise_data,
+# rnnoise_tables,parse_lpcnet_weights,pitch,celt_lpc,kiss_fft}.c with gcc -O2).
+# (extras/denoise-v0.1 has the v0.1 code Chirp used before; its reference is build/librnnoise.a)
+if [ -f rnnoise-ref/build3/librnnoise3.a ]; then
+    $CXX -O2 -Wno-psabi -o out/denoise_test.exe denoise_test.cpp $S/denoise.cpp $S/fft.cpp rnnoise-ref/build3/librnnoise3.a
     ./out/denoise_test.exe | grep -E "matches|quieter|speed|passed|FAIL"
+    # (the network alone, layer by layer: build3/netref.c is xiph's rnn.c with its GRU state exposed)
+    if [ -f rnnoise-ref/build3/netref.o ]; then
+        $CXX -O2 -Wno-psabi -DDENOISE_TEST -o out/denoise_net_test.exe denoise_net_test.cpp $S/denoise.cpp rnnoise-ref/build3/netref.o rnnoise-ref/build3/librnnoise3.a
+        ./out/denoise_net_test.exe | tail -1
+    fi
 fi
 # Interop with ts-mls, an independent MLS (in interop/: npm install there, then node patch_ts_mls.mjs)
 if [ -d interop/node_modules/ts-mls ]; then

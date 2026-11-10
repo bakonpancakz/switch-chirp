@@ -20,6 +20,7 @@
 #include "game.h"
 #include "mic.h"
 #include "screen.h"
+#include "sounds.h"
 #include "mixer.h"
 #include "aes.h"
 #include "avatars.h"
@@ -51,9 +52,39 @@ u64 nowMs() { return armTicksToNs(armGetSystemTick()) / 1000000ULL; }
 
 void random(void* out, size_t n) { randomGet(out, n); }
 
+// --- the card: written by a thread of its own ---
+// There's one file system session (main.cpp), so a write on any thread waits for every other's. Log
+// lines written where they were said kept the call's thread (which feeds the mixer) waiting behind a
+// loading screen's read or an avatar's write, long enough for the sound to run dry; and every step of
+// an overlay slider wrote its .ini again. Now lines are queued in memory and written by this thread,
+// and the .ini files a second after their last change
+constexpr size_t LOGQ = 8192;          // (lines waiting to be written: a few dozen)
+constexpr u64 SAVE_AFTER_MS = 1000;     // (a setting changed: saved once it's been left this long)
+Mutex g_card_lock;                      // (the queue and what's due; zero: unlocked)
+CondVar g_card_cv;
+Thread g_card_thread;
+bool g_card_thread_on = false;
+char g_logq[LOGQ];                      // ([u64 wall clock][the line, NUL-terminated])...
+size_t g_logq_n = 0;
+uint32_t g_log_dropped = 0;             // (lines that didn't fit: said in the log once there's room)
+u64 g_settings_due = 0, g_prefs_due = 0;  // (when to save settings.ini, people.ini: 0, nothing to)
+int g_sound = -1;                       // (a call sound to read and play: sounds::Kind; -1, none)
+
+// A call sound, read and played by the card's thread (any thread may ask; the latest asked wins)
+void playSound(sounds::Kind k) {
+    mutexLock(&g_card_lock);
+    g_sound = k;
+    mutexUnlock(&g_card_lock);
+    condvarWakeOne(&g_card_cv);
+}
+
 // --- shared with the IPC thread, under g_lock ---
 
 Mutex g_lock;
+// The people's mutes and volumes (store.h's prefs): read by the mixer every 20 ms for each voice, so
+// under a lock of their own, never the network thread's g_lock (held while it reads Discord's messages,
+// a GUILD_CREATE can be tens of KB: the mixer waited, and the sound ran dry). Changed holding both
+Mutex g_prefs_lock;
 Thread g_thread;
 volatile bool g_run = false;
 bool g_sockets = false, g_ssl = false;
@@ -91,7 +122,8 @@ char g_login_active[CHIRP_NAME] = "";  // the one connected as (empty: token.txt
 // the mic's settings (settings.ini): input volume (percent), sensitivity (0 automatic, else dBFS), automatic gain
 int g_mic_volume = 100, g_mic_sensitivity = MIC_SENSITIVITY_AUTO;
 bool g_mic_agc = true, g_mic_denoise = true;
-bool g_full_range = false;  // (the screen's video labelled full range)// the bot's presence (settings.ini): invisible (shows offline, the default: not online whenever the
+bool g_full_range = false;  // (the screen's video labelled full range)
+// the bot's presence (settings.ini): invisible (shows offline, the default: not online whenever the
 // Switch is on), and Rich Presence ("Playing <game>"); dirty: say it again
 bool g_invisible = true, g_rpc = false, g_rpc_dirty = true;
 char g_game[CHIRP_NAME] = "";  // (what Rich Presence says: empty, nothing)
@@ -142,12 +174,15 @@ void loadSettings() {
         else if (!strncmp(line, "noise_suppression=", 18)) g_mic_denoise = !strcmp(line + 18, "true");
         else if (!strncmp(line, "full_range_video=", 17)) g_full_range = !strcmp(line + 17, "true");
         else if (!strncmp(line, "appear_invisible=", 17)) g_invisible = !strcmp(line + 17, "true");
-        else if (!strncmp(line, "rich_presence=", 14)) g_rpc = !strcmp(line + 14, "true");    }
+        else if (!strncmp(line, "rich_presence=", 14)) g_rpc = !strcmp(line + 14, "true");
+    }
     fclose(f);
 }
 
+// settings.ini written again (the card's writer thread does, a second after a change: settingsChanged())
 void saveSettings() {
     char text[512], sens[8];
+    mutexLock(&g_lock);  // (the settings are the IPC thread's to change: a snapshot)
     if (g_mic_sensitivity < 0) snprintf(sens, sizeof(sens), "%d", g_mic_sensitivity);
     else snprintf(sens, sizeof(sens), "auto");
     int n = snprintf(text, sizeof(text),
@@ -158,6 +193,7 @@ void saveSettings() {
                      "# the bot: offline to everyone while connected; \"Playing <game>\"\nappear_invisible=%s\nrich_presence=%s\n",
                      g_login, g_mic_volume, sens, g_mic_agc ? "true" : "false", g_mic_denoise ? "true" : "false",
                      g_full_range ? "true" : "false", g_invisible ? "true" : "false", g_rpc ? "true" : "false");
+    mutexUnlock(&g_lock);
     Card c;
     if (!c.ok) return;
     // (snprintf says what it would have written: past the buffer, fwrite would have read past it too)
@@ -342,10 +378,25 @@ void syncVoice() {
         screen::setWanted(false);
         log("Screenshare off: out of the call");
     }
+    // The call's sounds (sounds.h), the same for us and everyone else: the bot coming into a channel and
+    // going out of it, and other people coming into ours and going out of it
+    // (and while sharing the screen, someone starting to watch it, or stopping: so you can tell)
+    static uint32_t joined_seen = 0, left_seen = 0, watch_seen = 0, unwatch_seen = 0;
+    if (channel && channel != was_channel) playSound(sounds::VoiceJoin);
+    else if (!channel && was_channel) playSound(sounds::VoiceLeave);
+    else if (channel && g_gw.othersJoined() != joined_seen) playSound(sounds::VoiceJoin);
+    else if (channel && g_gw.othersLeft() != left_seen) playSound(sounds::VoiceLeave);
+    else if (channel && g_gw.viewersJoined() != watch_seen) playSound(sounds::ScreenshareJoin);
+    else if (channel && g_gw.viewersLeft() != unwatch_seen) playSound(sounds::ScreenshareLeave);
+    joined_seen = g_gw.othersJoined(), left_seen = g_gw.othersLeft();
+    watch_seen = g_gw.viewersJoined(), unwatch_seen = g_gw.viewersLeft();
     was_channel = channel;
     // Share Screen is Go Live: once the call's connection is up, a stream is asked for; Discord names
-    // its voice server, and the stream's own connection goes there. Off, or out of the call: ended
-    bool want = screen::wanted() && channel && guild && voice::state() == voice::Voice_Connected;
+    // its voice server, and the stream's own connection goes there. Off, or out of the call: ended. (A
+    // stream already going stays while the call's connection reconnects: ended then, every blip kicked
+    // the viewers off it)
+    bool streaming = g_stream_channel == channel && g_stream_guild == guild;
+    bool want = screen::wanted() && channel && guild && (streaming || voice::state() == voice::Voice_Connected);
     if (want && (g_stream_guild != guild || g_stream_channel != channel)) {
         if (g_stream_channel) g_gw.streamDelete(g_stream_guild, g_stream_channel);
         if (g_gw.streamCreate(guild, channel)) g_stream_guild = guild, g_stream_channel = channel;
@@ -362,17 +413,17 @@ void syncVoice() {
 
 // Each speaker's volume for the mixer (its thread asks, every frame): percent, 0 when muted for us
 int gainFor(uint64_t user) {
-    mutexLock(&g_lock);
+    mutexLock(&g_prefs_lock);
     int v = store::prefMute(user) ? 0 : store::prefVolume(user);
-    mutexUnlock(&g_lock);
+    mutexUnlock(&g_prefs_lock);
     return mixer::gainQ12(v);
 }
 
 // What the IPC thread queued, run here (under g_lock)
 void runPending() {
+    if (!g_gw.ready()) return;  // (kept until it is: Join pressed while connecting isn't lost)
     Pending p = g_pending;
     g_pending.join = g_pending.leave = g_pending.voice = false;
-    if (!g_gw.ready()) return;
     uint64_t guild = g_gw.callChannel() ? callGuild() : 0;
     if (p.join) {
         g_want_mute = p.j.muted != 0;
@@ -439,16 +490,30 @@ bool session(const char* token) {
         if (nowMs() >= next_limits) {
             limits::watch(logFn);
             next_limits = nowMs() + 1000;
-            // (the application running (in front or suspended behind the HOME menu), logged when it changes, homebrew too: Rich Presence names real games
-            // only, and the screen's recorder follows whatever this is)
+            // (the application running, in front or behind the HOME menu, homebrew too (Rich Presence names
+            // real games only), logged when it changes; with whether it lets the system record video, read
+            // with its name, which needs the screen's queue empty: tried each second until it's known)
             static uint64_t shown_app = ~0ULL;
+            static bool capture_known = false;
             uint64_t app = game::running();
-            if (app != shown_app) {
-                shown_app = app;
-                char line[96];
-                if (app) snprintf(line, sizeof(line), "application running: %016llX%s", (unsigned long long)app,
-                                  (app >> 56) == 0x01 ? "" : " (not a game: homebrew?)");
-                else snprintf(line, sizeof(line), "application running: none (nothing open, the HOME menu alone)");
+            bool changed = app != shown_app;
+            if (changed) shown_app = app, capture_known = false;
+            int capture = -1;
+            if (app && !capture_known) {
+                char name[CHIRP_NAME];
+                game::name(app, name, sizeof(name), &capture);
+                capture_known = capture >= 0;
+            }
+            screen::setTitle(app, capture);  // (video's asked for only while one that records runs)
+            // (said when it changes, and again once the capture setting's known)
+            if (changed || capture >= 0) {
+                static const char* const CAPTURE[] = {"doesn't allow video capture", "allows video capture on request",
+                                                      "allows video capture"};
+                char line[160];
+                if (!app) snprintf(line, sizeof(line), "application running: none (nothing open, the HOME menu alone)");
+                else snprintf(line, sizeof(line), "application running: %016llX%s, %s", (unsigned long long)app,
+                              (app >> 56) == 0x01 ? "" : " (not a game: homebrew?)",
+                              capture < 0 ? "its video capture setting not read yet" : capture <= 2 ? CAPTURE[capture] : "an unknown video capture setting");
                 log(line);
             }
         }
@@ -516,7 +581,8 @@ void netThread(void*) {
 
     loadSettings();
     mic::setSettings(g_mic_volume, g_mic_sensitivity, g_mic_agc, g_mic_denoise);
-    screen::setFullRange(g_full_range);    size_t failures = 0;
+    screen::setFullRange(g_full_range);
+    size_t failures = 0;
     char token[128];
     while (g_run) {
         mutexLock(&g_lock);
@@ -560,6 +626,36 @@ void netThread(void*) {
 }  // namespace
 
 void log(const char* line) {
+    u64 t = (u64)wallClock();
+    size_t n = strlen(line) + 1;
+    if (n > 512) n = 512;  // (a line longer than any said: cut)
+    mutexLock(&g_card_lock);
+    if (g_logq_n + sizeof(t) + n <= LOGQ) {
+        memcpy(g_logq + g_logq_n, &t, sizeof(t));
+        memcpy(g_logq + g_logq_n + sizeof(t), line, n);
+        g_logq[g_logq_n + sizeof(t) + n - 1] = 0;
+        g_logq_n += sizeof(t) + n;
+    } else {
+        g_log_dropped++;
+    }
+    mutexUnlock(&g_card_lock);
+    if (g_card_thread_on) condvarWakeOne(&g_card_cv);
+}
+
+static void savePrefs();
+
+namespace {
+
+// The queued lines onto the card (the writer thread's)
+void writeLog() {
+    static char batch[LOGQ];
+    mutexLock(&g_card_lock);
+    size_t n = g_logq_n;
+    uint32_t dropped = g_log_dropped;
+    memcpy(batch, g_logq, n);
+    g_logq_n = 0, g_log_dropped = 0;
+    mutexUnlock(&g_card_lock);
+    if (!n && !dropped) return;
     Card c;
     if (!c.ok) return;
     makeDir();
@@ -568,21 +664,75 @@ void log(const char* line) {
         remove(CHIRP_DIR "/chirp.old.log");
         rename(CHIRP_LOG, CHIRP_DIR "/chirp.old.log");
     }
-    // (opened and closed for every line: FTP can copy it while Chirp runs)
-    if (FILE* f = fopen(CHIRP_LOG, "ab")) {
+    // (opened and closed for each batch: FTP can copy it while Chirp runs)
+    FILE* f = fopen(CHIRP_LOG, "ab");
+    if (!f) return;
+    for (size_t at = 0; at + sizeof(u64) < n;) {
+        u64 t;
+        memcpy(&t, batch + at, sizeof(t));
+        const char* line = batch + at + sizeof(t);
         TimeCalendarTime cal = {};
         TimeCalendarAdditionalInfo info = {};
-        timeToCalendarTimeWithMyRule((u64)wallClock(), &cal, &info);
+        timeToCalendarTimeWithMyRule(t, &cal, &info);
         fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u %s\n", cal.year, cal.month, cal.day, cal.hour, cal.minute, cal.second, line);
-        fclose(f);
+        at += sizeof(t) + strlen(line) + 1;
     }
+    if (dropped) fprintf(f, "(%u log lines didn't fit in the queue: not written)\n", dropped);
+    fclose(f);
 }
+
+// What's due: the log, settings.ini and people.ini a second after their last change
+void cardWork(bool all) {
+    writeLog();
+    u64 now = nowMs();
+    mutexLock(&g_card_lock);
+    bool settings = g_settings_due && (all || now >= g_settings_due);
+    bool prefs = g_prefs_due && (all || now >= g_prefs_due);
+    if (settings) g_settings_due = 0;
+    if (prefs) g_prefs_due = 0;
+    int sound = g_sound;
+    g_sound = -1;
+    mutexUnlock(&g_card_lock);
+    if (sound >= 0) sounds::load((sounds::Kind)sound);
+    if (settings) saveSettings();
+    if (prefs) savePrefs();
+    if (settings || prefs) writeLog();  // (what saving them said)
+}
+
+void cardThread(void*) {
+    while (g_run) {
+        mutexLock(&g_card_lock);
+        if (!g_logq_n && g_sound < 0) condvarWaitTimeout(&g_card_cv, &g_card_lock, 250'000'000ULL);
+        mutexUnlock(&g_card_lock);
+        cardWork(false);
+    }
+    cardWork(true);
+}
+
+void settingsChanged() {
+    mutexLock(&g_card_lock);
+    g_settings_due = nowMs() + SAVE_AFTER_MS;
+    mutexUnlock(&g_card_lock);
+}
+
+void prefsChanged() {
+    mutexLock(&g_card_lock);
+    g_prefs_due = nowMs() + SAVE_AFTER_MS;
+    mutexUnlock(&g_card_lock);
+}
+
+}  // namespace
 
 static void loadPrefs();  // (people.ini, further down with its saving)
 
 void start() {
     mutexInit(&g_lock);
+    mutexInit(&g_prefs_lock);
+    condvarInit(&g_card_cv);
     g_run = true;
+    // (low: the card can wait; 0x2000 of stack is room for fprintf)
+    g_card_thread_on = R_SUCCEEDED(threadCreate(&g_card_thread, cardThread, nullptr, nullptr, 0x2000, 0x2E, -2));
+    if (g_card_thread_on) threadStart(&g_card_thread);
     log("Chirp started");
     const char* crypto = nullptr;
     aesSelfTest(&crypto);
@@ -602,6 +752,12 @@ void stop() {
     g_run = false;
     threadWaitForExit(&g_thread);
     threadClose(&g_thread);
+    if (g_card_thread_on) {
+        condvarWakeAll(&g_card_cv);
+        threadWaitForExit(&g_card_thread);
+        threadClose(&g_card_thread);
+        g_card_thread_on = false;
+    }
     avatars::stop();
     mic::stop();
     screen::stop();
@@ -740,14 +896,13 @@ void setSelfDeaf(bool on) {
     mixer::setDeaf(on);
 }
 
-// people.ini, written again whenever a mute or volume changes (only the IPC
-// thread does: one write at a time)
+// people.ini, written again a second after a mute or volume changes (the card's writer thread does)
 static char g_prefs_text[STORE_PREFS * 40 + 256];
 
 static void savePrefs() {
-    mutexLock(&g_lock);
+    mutexLock(&g_prefs_lock);
     size_t n = store::prefsWrite(g_prefs_text, sizeof(g_prefs_text));
-    mutexUnlock(&g_lock);
+    mutexUnlock(&g_prefs_lock);
     Card c;
     if (!c.ok) return;
     if (!writeFile(CHIRP_PEOPLE_INI, g_prefs_text, n)) log("couldn't save people.ini");
@@ -761,31 +916,39 @@ static void loadPrefs() {
     size_t n = fread(g_prefs_text, 1, sizeof(g_prefs_text), f);
     fclose(f);
     mutexLock(&g_lock);
+    mutexLock(&g_prefs_lock);
     store::prefsRead(g_prefs_text, n);
+    mutexUnlock(&g_prefs_lock);
     mutexUnlock(&g_lock);
 }
 
 void setUserMute(uint64_t user, bool on) {
     mutexLock(&g_lock);
+    mutexLock(&g_prefs_lock);
     store::prefSetMute(user, on);
+    mutexUnlock(&g_prefs_lock);
     mutexUnlock(&g_lock);
-    savePrefs();
+    prefsChanged();
 }
 
 void setUserVolume(uint64_t user, int volume) {
     mutexLock(&g_lock);
+    mutexLock(&g_prefs_lock);
     store::prefSetVolume(user, volume);
+    mutexUnlock(&g_prefs_lock);
     mutexUnlock(&g_lock);
-    savePrefs();
+    prefsChanged();
 }
 
 void setVolume(int volume) {
     mutexLock(&g_lock);
+    mutexLock(&g_prefs_lock);
     store::prefSetVolume(STORE_EVERYONE, volume);
     int v = store::prefVolume(STORE_EVERYONE);
+    mutexUnlock(&g_prefs_lock);
     mutexUnlock(&g_lock);
     mixer::setMaster(mixer::gainQ12(v));
-    savePrefs();
+    prefsChanged();
 }
 
 void soundCheck(bool on) { mixer::setSoundCheck(on); }
@@ -801,7 +964,7 @@ void setMic(int volume, int sensitivity, bool agc, bool denoise) {
     g_mic_denoise = denoise;
     mic::setSettings(g_mic_volume, g_mic_sensitivity, g_mic_agc, g_mic_denoise);
     mutexUnlock(&g_lock);
-    saveSettings();
+    settingsChanged();
 }
 
 void setInvisible(bool on) {
@@ -810,7 +973,7 @@ void setInvisible(bool on) {
     g_gw.setInvisible(on);
     g_rpc_dirty = true;
     mutexUnlock(&g_lock);
-    saveSettings();
+    settingsChanged();
 }
 
 void setRichPresence(bool on) {
@@ -818,7 +981,7 @@ void setRichPresence(bool on) {
     g_rpc = on;
     g_rpc_dirty = true;
     mutexUnlock(&g_lock);
-    saveSettings();
+    settingsChanged();
 }
 
 void setFullRange(bool on) {
@@ -826,7 +989,7 @@ void setFullRange(bool on) {
     g_full_range = on;
     screen::setFullRange(on);
     mutexUnlock(&g_lock);
-    saveSettings();
+    settingsChanged();
 }
 
 void debug(ChirpDebug* d) {
@@ -864,7 +1027,7 @@ void setLogin(const char* name) {
     mutexLock(&g_lock);
     snprintf(g_login, sizeof(g_login), "%s", name);
     mutexUnlock(&g_lock);
-    saveSettings();
+    settingsChanged();
     reload();  // (a new session, as that bot)
 }
 

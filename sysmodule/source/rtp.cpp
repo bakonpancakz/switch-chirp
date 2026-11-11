@@ -59,6 +59,80 @@ bool rtpOpen(RtpMode mode, const uint8_t key[RTP_KEY], const uint8_t* pkt, size_
     return true;
 }
 
+size_t rtcpOpen(RtpMode mode, const uint8_t key[RTP_KEY], const uint8_t* pkt, size_t n, uint8_t* out) {
+    constexpr size_t AAD = 8;
+    if (n < AAD + 16 + 4 || (pkt[0] >> 6) != 2 || pkt[1] < 200 || pkt[1] > 206) return 0;
+    size_t ct_n = n - AAD - 16 - 4;
+    if (!open(mode, key, pkt + n - 4, pkt, AAD, pkt + AAD, ct_n, pkt + n - 20, out + AAD)) return 0;
+    memcpy(out, pkt, AAD);
+    return AAD + ct_n;
+}
+
+size_t rtcpSenderReport(RtpMode mode, const uint8_t key[RTP_KEY], uint32_t* counter, uint32_t ssrc, uint64_t wall_ns,
+                        uint32_t rtp_ts, uint32_t packets, uint32_t octets, uint8_t* out) {
+    auto put32 = [](uint8_t* p, uint32_t v) {
+        for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (24 - 8 * i));
+    };
+    out[0] = 0x80, out[1] = 200, out[2] = 0, out[3] = 6;  // (V=2, no report blocks; 7 words)
+    put32(out + 4, ssrc);
+    uint8_t body[20];
+    uint64_t sec = wall_ns / 1'000'000'000ULL, ns = wall_ns % 1'000'000'000ULL;
+    put32(body, (uint32_t)(sec + 2208988800ULL));                    // (NTP: seconds since 1900)
+    put32(body + 4, (uint32_t)((ns << 32) / 1'000'000'000ULL));      // (and its fraction)
+    put32(body + 8, rtp_ts);
+    put32(body + 12, packets);
+    put32(body + 16, octets);
+    uint32_t c = ++*counter;
+    uint8_t* nonce4 = out + 8 + 20 + 16;
+    put32(nonce4, c);
+    if (mode == Rtp_Aes256Gcm) {
+        uint8_t iv[GCM_IV] = {0};
+        memcpy(iv, nonce4, 4);
+        Gcm g;
+        g.init(key, RTP_KEY);
+        g.seal(iv, out, 8, body, 20, out + 8, out + 28, GCM_TAG);
+        g.wipeKey();
+    } else {
+        uint8_t iv[XCHACHA_NONCE] = {0};
+        memcpy(iv, nonce4, 4);
+        xchachaSeal(key, iv, out, 8, body, 20, out + 8, out + 28);
+    }
+    return RTCP_SR_SIZE;
+}
+
+size_t rtcpFeedback(const uint8_t* p, size_t n, uint32_t media_ssrc, uint16_t* lost, size_t max, RtcpFeedback* fb) {
+    size_t got = 0;
+    while (n >= 4 && (p[0] >> 6) == 2) {
+        size_t len = 4u * (be16(p + 2) + 1u);
+        if (len > n) break;
+        uint8_t fmt = p[0] & 0x1f, pt = p[1];
+        uint32_t media = len >= 12 ? be32(p + 8) : 0;
+        if (pt == 205 && fmt == 1 && len >= 16) {  // (Generic NACK: a lost packet's number, and a bitmask of the 16 after it)
+            if (media == media_ssrc) {
+                fb->nacks++;
+                for (size_t i = 12; i + 4 <= len; i += 4) {
+                    uint16_t pid = be16(p + i), blp = be16(p + i + 2);
+                    for (int b = -1; b < 16; b++) {
+                        if (b >= 0 && !(blp >> b & 1)) continue;
+                        fb->lost++;
+                        if (got < max) lost[got++] = (uint16_t)(pid + 1 + b);
+                    }
+                }
+            } else {
+                fb->other++;
+            }
+        } else if (pt == 206 && (fmt == 1 || fmt == 4)) {  // (PLI, FIR: a keyframe wanted)
+            fb->keyframes++;
+        } else if (pt == 206 && fmt == 15 && len >= 16 && memcmp(p + 12, "REMB", 4) == 0) {
+            fb->remb++;
+        } else {
+            fb->other++;
+        }
+        p += len, n -= len;
+    }
+    return got;
+}
+
 size_t rtpSeal(RtpMode mode, const uint8_t key[RTP_KEY], uint32_t* counter, uint16_t seq, uint32_t timestamp, uint32_t ssrc,
                const uint8_t* payload, size_t payload_n, uint8_t* out) {
     return rtpSealAs(mode, key, counter, RTP_OPUS, false, seq, timestamp, ssrc, payload, payload_n, out);

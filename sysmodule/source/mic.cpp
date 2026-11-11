@@ -8,6 +8,8 @@
 
 #ifdef __SWITCH__
 #include <switch.h>
+
+#include "homelight.h"
 #endif
 
 namespace mic {
@@ -300,6 +302,7 @@ void close() {
 
 void micThread(void*) {
     while (g_run) {
+        homelight::update(g_speaking);  // (the HOME button's light: talk being sent; muted, the mic's closed: off)
         if (!g_call || g_muted) {
             close();
             svcSleepThread(100'000'000LL);
@@ -327,6 +330,7 @@ void micThread(void*) {
         audinAppendAudioInBuffer(rel);
     }
     close();
+    homelight::update(false);
 }
 
 }  // namespace

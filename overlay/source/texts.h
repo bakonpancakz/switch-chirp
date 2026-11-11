@@ -99,6 +99,8 @@ inline constexpr const char* MIC_LEVEL_VALUE = "%d dB / %d dB";
 inline constexpr const char* MIC_CLOSED = "Closed (muted)";
 inline constexpr const char* AGC = "Automatic Gain Control";
 inline constexpr const char* DENOISE = "Noise Suppression";
+inline constexpr const char* HOME_LIGHT = "HOME Button Light";  // (lit while you talk; the slider is its brightness)
+inline constexpr const char* LIGHT_OFF = "Off";
 inline constexpr const char* SCREENSHARE_SECTION = "Screenshare";
 inline constexpr const char* FULL_RANGE = "Full Range Colour";  // (for when blacks look crushed)
 

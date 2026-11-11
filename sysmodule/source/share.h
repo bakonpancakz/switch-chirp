@@ -49,12 +49,16 @@ class Video {
 public:
     Video(Frames* frames, Loading* loading, Sink* sink) : frames_(frames), loading_(loading), sink_(sink) {}
     void reset(uint64_t now_ms);  // (a new connection)
+    // Frames older than this when their turn comes (system ticks since recorded; 0: never) aren't sent:
+    // the ones after wait for the next keyframe. Late frames sent anyway made viewers' players freeze,
+    // then rush through them to catch up; skipped, the picture jumps to now at the next keyframe
+    void setStale(uint64_t ticks) { stale_ticks_ = ticks; }
     // The next frame sent (or a placeholder, when it's time for one): true if one was taken, and another
     // may be waiting. now_tick: the system's ticks now (a placeholder's recorded time)
     bool step(uint64_t now_ms, uint64_t now_tick);
 
     struct Stats {
-        uint32_t sent, keyframes, waited, failed, placeholders;
+        uint32_t sent, keyframes, waited, failed, placeholders, stale;
     };
     void takeStats(Stats* out);
 
@@ -70,6 +74,7 @@ private:
     H264Params grey_params_;  // (grey's: the recorder's SPS, as the frames it stands in for)
     H264Params loading_params_;  // (the loading screens' own, ids 1)
     bool need_idr_ = false;
+    uint64_t stale_ticks_ = 0;
     uint64_t last_frame_ms_ = 0, next_placeholder_ms_ = 0;
     int grey_id_ = 0;
     char pick_[160] = {0};  // (this time's loading screen: picked when the game's picture goes)

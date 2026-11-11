@@ -20,6 +20,8 @@
 #include "screenclock.h"
 #include "share.h"
 #include "sounds.h"
+#include "aes.h"
+#include "rtp.h"
 
 static int g_fail = 0, g_pass = 0;
 #define CHECK(c)                                                       \
@@ -867,6 +869,7 @@ struct FakeFrames : share::Frames {
     struct F {
         std::vector<uint8_t> bytes;
         bool gap;
+        uint64_t tick = 0;
     };
     std::vector<F> waiting;
     uint8_t buf[8192];
@@ -875,7 +878,7 @@ struct FakeFrames : share::Frames {
     bool take(uint8_t** f, size_t* n, size_t* cap, uint64_t* tick, bool* gap) override {
         if (waiting.empty()) return false;
         memcpy(buf, waiting[0].bytes.data(), waiting[0].bytes.size());
-        *f = buf, *n = waiting[0].bytes.size(), *cap = sizeof(buf), *tick = 0, *gap = waiting[0].gap;
+        *f = buf, *n = waiting[0].bytes.size(), *cap = sizeof(buf), *tick = waiting[0].tick, *gap = waiting[0].gap;
         return true;
     }
     void done() override { waiting.erase(waiting.begin()); }
@@ -983,6 +986,21 @@ static void testShareVideo() {
     CHECK(sink.sent.size() == 2 && sink.sent[1].keyframe);
     v.takeStats(&st);
     CHECK(st.failed == 1 && st.waited == 1);
+
+    // frames too late (they waited behind a slow network) aren't sent; the ones after wait for a keyframe,
+    // which goes even late; in time again, they go
+    sink.sent.clear();
+    v.setStale(300);
+    frames.waiting.push_back({h264Frame(false, 13), false, 1000});  // (1000 ticks late: skipped)
+    frames.waiting.push_back({h264Frame(false, 14), false, 1990});  // (in time, but after a skipped one)
+    frames.waiting.push_back({h264Frame(true, 15), false, 1000});   // (late, but a keyframe)
+    frames.waiting.push_back({h264Frame(false, 16), false, 1995});
+    while (v.step(now, 2000)) {
+    }
+    CHECK(sink.sent.size() == 2 && sink.sent[0].keyframe && !sink.sent[1].keyframe);
+    v.takeStats(&st);
+    CHECK(st.stale == 1 && st.waited == 1);
+    v.setStale(0);
 
     // no frames for a while: the loading screen, again every 2 s, not in between
     sink.sent.clear();
@@ -1123,8 +1141,82 @@ static void testSounds() {
     CHECK(mixer::soundFrame(same.data(), same.size(), 48000, &pos, out) && out[0] == 123 && out[959] == 123);
 }
 
+// Viewers' RTCP: opened as Discord seals it, and its feedback read
+static void testRtcp() {
+    auto put16 = [](std::vector<uint8_t>& v, uint16_t x) { v.push_back((uint8_t)(x >> 8)), v.push_back((uint8_t)x); };
+    auto put32 = [&](std::vector<uint8_t>& v, uint32_t x) { put16(v, (uint16_t)(x >> 16)), put16(v, (uint16_t)x); };
+    const uint32_t VSSRC = 0x11223344, OTHER = 0x55667788;
+    // a receiver report (header only), a NACK for our video (packet 1000, and 1001 and 1004 by the bitmask,
+    // then 2000 alone), a PLI, a REMB, and a NACK for another stream
+    std::vector<uint8_t> c;
+    c = {0x80, 201, 0, 1}, put32(c, 0xAAAA0001);
+    c.push_back(0x81), c.push_back(205), put16(c, 4), put32(c, 0xAAAA0001), put32(c, VSSRC);
+    put16(c, 1000), put16(c, 0x0009), put16(c, 2000), put16(c, 0);
+    c.push_back(0x81), c.push_back(206), put16(c, 2), put32(c, 0xAAAA0001), put32(c, VSSRC);
+    c.push_back(0x8F), c.push_back(206), put16(c, 5), put32(c, 0xAAAA0001), put32(c, 0);
+    c.insert(c.end(), {'R', 'E', 'M', 'B', 1, 0, 0, 0}), put32(c, VSSRC);
+    c.push_back(0x81), c.push_back(205), put16(c, 3), put32(c, 0xAAAA0001), put32(c, OTHER), put16(c, 7), put16(c, 0);
+    uint16_t lost[8];
+    RtcpFeedback fb = {};
+    size_t k = rtcpFeedback(c.data(), c.size(), VSSRC, lost, 8, &fb);
+    CHECK(k == 4 && lost[0] == 1000 && lost[1] == 1001 && lost[2] == 1004 && lost[3] == 2000);
+    CHECK(fb.nacks == 1 && fb.lost == 4 && fb.keyframes == 1 && fb.remb == 1 && fb.other == 2);
+    // more named than fit: counted, not written past the end
+    fb = {};
+    k = rtcpFeedback(c.data(), c.size(), VSSRC, lost, 2, &fb);
+    CHECK(k == 2 && fb.lost == 4);
+    // a length past the end: read up to it, no further
+    std::vector<uint8_t> bad = c;
+    bad[2] = 0x7f;
+    fb = {};
+    CHECK(rtcpFeedback(bad.data(), bad.size(), VSSRC, lost, 8, &fb) == 0 && fb.nacks == 0);
+
+    // sealed as Discord does (the first 8 bytes the AAD, the rest AES-256-GCM, tag, 4-byte nonce): opens
+    uint8_t key[RTP_KEY];
+    for (int i = 0; i < RTP_KEY; i++) key[i] = (uint8_t)(i * 7 + 1);
+    std::vector<uint8_t> pkt(c.begin(), c.begin() + 8);
+    pkt.resize(c.size() + 16 + 4);
+    uint8_t iv[GCM_IV] = {0, 0, 0, 42};
+    Gcm g;
+    g.init(key, RTP_KEY);
+    g.seal(iv, c.data(), 8, c.data() + 8, c.size() - 8, pkt.data() + 8, pkt.data() + c.size(), GCM_TAG);
+    memcpy(pkt.data() + c.size() + 16, iv, 4);
+    std::vector<uint8_t> out(pkt.size());
+    size_t on = rtcpOpen(Rtp_Aes256Gcm, key, pkt.data(), pkt.size(), out.data());
+    CHECK(on == c.size() && memcmp(out.data(), c.data(), c.size()) == 0);
+    pkt[12] ^= 1;  // (tampered: doesn't open)
+    CHECK(rtcpOpen(Rtp_Aes256Gcm, key, pkt.data(), pkt.size(), out.data()) == 0);
+    // only counted (no room for the numbers): nothing written
+    fb = {};
+    CHECK(rtcpFeedback(c.data(), c.size(), VSSRC, nullptr, 0, &fb) == 0 && fb.lost == 4 && fb.remb == 1);
+
+    // a Sender Report of ours: sealed as viewers' reports are, opens to the right fields
+    for (RtpMode mode : {Rtp_Aes256Gcm, Rtp_XChaCha}) {
+        uint8_t sr[RTCP_SR_SIZE], op[RTCP_SR_SIZE];
+        uint32_t counter = 41;
+        size_t m = rtcpSenderReport(mode, key, &counter, VSSRC, 3'500'000'000ULL, 0xABCDEF01, 1234, 567890, sr);
+        CHECK(m == RTCP_SR_SIZE && counter == 42 && sr[1] == 200 && sr[3] == 6);
+        size_t on2 = rtcpOpen(mode, key, sr, m, op);
+        auto be32at = [&](size_t o) { return (uint32_t)op[o] << 24 | (uint32_t)op[o + 1] << 16 | (uint32_t)op[o + 2] << 8 | op[o + 3]; };
+        CHECK(on2 == 28 && be32at(4) == VSSRC && be32at(8) == 3 + 2208988800u);
+        CHECK(be32at(12) == 0x80000000u && be32at(16) == 0xABCDEF01 && be32at(20) == 1234 && be32at(24) == 567890);
+        fb = {};
+        rtcpFeedback(op, on2, VSSRC, nullptr, 0, &fb);
+        CHECK(fb.other == 1 && fb.nacks == 0);
+    }
+
+    // the sound's times put on the video's clock: none before the video's first frame, then by its offset
+    VideoClock vc;
+    uint64_t ns = 0;
+    CHECK(!vc.toLocal(1000, &ns));
+    vc.recorded(1000, 5'000'000'000ULL);
+    CHECK(vc.toLocal(1000, &ns) && ns == 5'000'000'000ULL);
+    CHECK(vc.toLocal(21333, &ns) && ns == 5'000'000'000ULL + 20'333'000);
+}
+
 int main() {
     srand(1234);
+    testRtcp();
     testUtil();
     testJson();
     testGateway();

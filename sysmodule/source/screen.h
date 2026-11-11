@@ -10,9 +10,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SCREEN_FRAME_MAX 0x54000  // (SysDVR's: an IDR frame can outgrow the system's own 0x32000, and fail)
+// (SysDVR's 0x54000 outgrew the system's own 0x32000; with grc's HQ preset and a higher bitrate a keyframe
+// outgrew that too: grc:d failed it with 2212-0006 (0xCD4) and the frames after waited for the next keyframe)
+#define SCREEN_FRAME_MAX 0x80000
 #define SCREEN_HEADROOM 0x2000    // (DAVE's growth: 4-byte start codes, the trailer)
-#define SCREEN_RING 0x60000       // (frames are queued here for sending: capture never waits for a keyframe to get out. 384 KB: a keyframe at 10 Mbps, ~200 KB, and the frames after it)
+#define SCREEN_RING 0xC0000       // (frames are queued here for sending: capture never waits for a keyframe to get out. 768 KB: at 10 Mbps a keyframe, ~200 KB, and over half a second of the frames after it)
 #define SCREEN_AUDIO_BYTES 240    // the game's sound: Opus, 20 ms in 240 bytes (96 kbps, mono)
 
 namespace screen {
@@ -27,10 +29,9 @@ void setFullRange(bool on);
 bool fullRange();
 bool wanted();
 void setCall(bool on);    // the voice connection can send video
-// The title running (0: none) and whether it lets the system record video (its control data's
-// VideoCapture: 0 no, 1 on request, 2 always; -1 not read yet): video is asked of grc:d only while one
-// that allows it runs (app.cpp says, each second)
-void setTitle(uint64_t title, int video_capture);
+// The title running (0: none): video is asked of grc:d only while one runs, a couple of seconds after
+// it opened (app.cpp says, each second)
+void setTitle(uint64_t title);
 bool active();            // capturing
 
 // The next frame, if one's ready: Annex-B H.264 in a buffer of *cap bytes (it may be changed in place),
@@ -46,6 +47,7 @@ struct AudioPacket {
     uint8_t data[SCREEN_AUDIO_BYTES];
     uint16_t n;
     uint32_t frame;  // which 20 ms it is (the RTP timestamp follows these)
+    uint64_t ns;     // when its first sample was recorded, on the video's clock (system ns; 0: not known)
 };
 bool takeAudio(AudioPacket* p);
 

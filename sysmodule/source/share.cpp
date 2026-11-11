@@ -75,6 +75,14 @@ bool Video::step(uint64_t now_ms, uint64_t now_tick) {
 
     next_placeholder_ms_ = 0;  // (the next time without the game's picture: a new pick, at once)
     if (gap) need_idr_ = true;
+    // Too late to be worth sending: skipped, and the ones after wait for a keyframe (a keyframe goes even
+    // late: it starts the picture over, and skipping it too could leave viewers frozen until the next)
+    if (!idr && stale_ticks_ && now_tick > tick && now_tick - tick > stale_ticks_) {
+        stats_.stale++;
+        need_idr_ = true;
+        frames_->done();
+        return true;
+    }
     if (need_idr_ && !idr) {
         stats_.waited++;
         frames_->done();

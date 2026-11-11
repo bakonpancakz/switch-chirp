@@ -20,12 +20,13 @@ namespace {
 // - A video transfer asked for while nothing records is never answered, not even once something does:
 //   capture stayed stuck in it, the stream on its loading screen, until the Switch was restarted
 //   (restarting Chirp didn't free it). The one seen: asked for a second after the first title since the
-//   boot opened. So video is asked for only while a title runs that lets the system record it (any
-//   title: a game, or sphaira and what runs in it), and not in its first seconds.
+//   boot opened. So video is asked for only while a title runs (any title: a game, or sphaira and what
+//   runs in it), and not in its first seconds.
+//   (Not by its control data's VideoCapture setting: a title that says no may record all the same, as
+//   with an installer's patch (DBI's), and the setting was read late: capture ran, then stopped for good)
 constexpr Result NOT_BEGUN = 0x3E8D4;
 constexpr u64 QUEUE_WAIT_MS = 300;  // (a full queue: how long a frame waits for room before it's dropped)
 constexpr u64 TITLE_SETTLE_MS = 2000;   // (a title just opened: this long before video's asked for)
-constexpr u64 CAPTURE_UNKNOWN_MS = 5000;  // (its capture setting not read by then: taken as allowed)
 
 alignas(0x1000) uint8_t g_buf[SCREEN_FRAME_MAX + SCREEN_HEADROOM];
 alignas(0x1000) uint8_t g_abuf[0x1000];
@@ -49,18 +50,13 @@ volatile bool g_no_game = false;
 // the title running, as app.cpp says (g_title_lock)
 Mutex g_title_lock;
 uint64_t g_title = 0, g_title_since = 0;  // (since: when it was first said, ticks)
-int g_title_capture = -1;
 
 // Whether video may be asked for now (see grc:d's rules above)
 bool titleRecords() {
     mutexLock(&g_title_lock);
     uint64_t title = g_title, since = g_title_since;
-    int capture = g_title_capture;
     mutexUnlock(&g_title_lock);
-    if (!title || capture == 0) return false;
-    uint64_t ms = armTicksToNs(armGetSystemTick() - since) / 1000000;
-    if (ms < TITLE_SETTLE_MS) return false;
-    return capture > 0 || ms >= CAPTURE_UNKNOWN_MS;
+    return title && armTicksToNs(armGetSystemTick() - since) / 1000000 >= TITLE_SETTLE_MS;
 }
 
 VideoClock g_vclock;
@@ -207,7 +203,9 @@ void videoThread(void*) {
         uint64_t tick = ts ? armNsToTicks(g_vclock.recorded(ts, now_ns)) : armGetSystemTick();
         uint64_t gap = 0;
         uint32_t missed = g_vclock.missed(ts, &gap);
-        if (missed) g_gap = true;  // (grc dropped them: the frames after refer to pictures we never got)
+        // (counted, not taken as lost: a step of 2-3 frames' time is grc not encoding a picture that didn't
+        // change, and the stream is whole. Taken as lost, the frames after waited for a keyframe: up to 938
+        // of 1553 in 30 s thrown away while capture never waited, and the stream stuttered all the time)
         stats([&](Stats& s) {
             s.captured++;
             s.skipped += missed;
@@ -220,9 +218,13 @@ void videoThread(void*) {
 
 // --- the game's sound ---
 
-// Stereo s16 frames (null: silence), mixed to mono, into 20 ms Opus packets
-void audioSamples(const int16_t* stereo, size_t frames) {
+uint64_t g_pkt_ns = 0;  // (when the packet being gathered began, on the video's clock: 0, not known)
+
+// Stereo s16 frames (null: silence), mixed to mono, into 20 ms Opus packets. first_ns: when the first
+// of them was recorded, on the video's clock (0: not known), so each packet says when it begins
+void audioSamples(const int16_t* stereo, size_t frames, uint64_t first_ns) {
     for (size_t i = 0; i < frames; i++) {
+        if (g_pcm_n == 0) g_pkt_ns = first_ns ? first_ns + i * 1'000'000'000ULL / AudioClock::RATE : 0;
         g_pcm[g_pcm_n++] = stereo ? (int16_t)(((int)stereo[2 * i] + stereo[2 * i + 1]) / 2) : 0;
         if (g_pcm_n < OPUSENC_FRAME) continue;
         g_pcm_n = 0;
@@ -237,6 +239,7 @@ void audioSamples(const int16_t* stereo, size_t frames) {
         opusencFrame(&g_enc, g_pcm, q.data, SCREEN_AUDIO_BYTES);
         q.n = SCREEN_AUDIO_BYTES;
         q.frame = frame;
+        q.ns = g_pkt_ns;
         __atomic_store_n(&g_aq_head, head + 1, __ATOMIC_RELEASE);
     }
 }
@@ -268,12 +271,17 @@ void audioThread(void*) {
         uint32_t frames = size / 4;
         AudioClock::Place at = g_aclock.place(ts, frames);
         if (at.hole) stats([](Stats& s) { s.audio_holes++; });
-        if (at.silence) audioSamples(nullptr, at.silence);
+        // (when the chunk was recorded, on the video's clock: what lines the sound up with the pictures)
+        uint64_t chunk_ns = 0;
+        if (!ts || !g_vclock.toLocal(ts, &chunk_ns)) chunk_ns = 0;
+        if (at.silence)
+            audioSamples(nullptr, at.silence,
+                         chunk_ns ? chunk_ns - (uint64_t)at.silence * 1'000'000'000ULL / AudioClock::RATE : 0);
         if (at.skip) {
             g_pcm_n = 0;  // (what was gathered goes; the next packet starts after the hole)
             g_aframe += at.skip / OPUSENC_FRAME + 1;
         }
-        audioSamples((const int16_t*)g_abuf, frames);
+        audioSamples((const int16_t*)g_abuf, frames, chunk_ns);
         stats([](Stats& s) { s.audio_chunks++; });
     }
 }
@@ -325,10 +333,9 @@ void setFullRange(bool on) { g_full_range = on; }
 bool fullRange() { return g_full_range; }
 void setCall(bool on) { g_call = on; }
 
-void setTitle(uint64_t title, int video_capture) {
+void setTitle(uint64_t title) {
     mutexLock(&g_title_lock);
-    if (title != g_title) g_title = title, g_title_since = armGetSystemTick(), g_title_capture = -1;
-    if (video_capture >= 0) g_title_capture = video_capture;
+    if (title != g_title) g_title = title, g_title_since = armGetSystemTick();
     mutexUnlock(&g_title_lock);
 }
 // (sharing, whether or not grc:d's open yet: before the first game since Chirp started it isn't, and

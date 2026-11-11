@@ -12,7 +12,7 @@
 
 class FrameQueue {
 public:
-    static constexpr uint32_t SLOTS = 16;  // (frames at most)
+    static constexpr uint32_t SLOTS = 32;  // (frames at most: half a second at 60)
 
     struct Frame {
         uint8_t* p;

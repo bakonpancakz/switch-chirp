@@ -573,14 +573,21 @@ tsl::elm::ListItem* infoRow(tsl::elm::List* list, const char* what, const std::s
 // The call page's Settings section: the mic's input volume, sensitivity (with the mic's level beside the
 // line, to pick it by) and automatic gain. Keys 7..10 keep the cursor on them when the page is made again
 struct MicSettings {
-    int volume = 100, sens = 0;
+    int volume = 100, sens = 0, light = 50;
     bool agc = true, denoise = true;
-    void send() const { client::setMic(volume, sens, agc, denoise); }
+    void send() const { client::setMic(volume, sens, agc, denoise, light); }
 } g_mic;
+
+// The HOME button's light: Off, then each of the light's 15 levels (as percent, 7% to 100%)
+constexpr size_t LIGHT_STEPS = 16;
+int lightOf(u16 step) { return (step * 100 + 7) / 15; }
+u16 lightStep(int light) { return (u16)((light * 15 + 50) / 100); }  // (as the sysmodule rounds it)
+std::string lightText(int light) { return light <= 0 ? std::string(txt::LIGHT_OFF) : std::to_string(light) + "%"; }
 
 tsl::elm::ListItem* addMicSettings(tsl::elm::List* list, u64* pick) {
     g_mic.volume = g_now.st.mic_volume, g_mic.sens = g_now.st.mic_sensitivity, g_mic.agc = g_now.st.mic_agc != 0;
     g_mic.denoise = g_now.st.mic_denoise != 0;
+    g_mic.light = g_now.st.mic_home_light;
     auto* vol = new tsl::elm::ListItem(txt::INPUT_VOLUME, std::to_string(g_mic.volume) + "%");
     vol->setClickListener([](u64) { return false; });
     list->addItem(vol);
@@ -616,6 +623,17 @@ tsl::elm::ListItem* addMicSettings(tsl::elm::List* list, u64* pick) {
         g_mic.send();
     });
     list->addItem(dn);
+    auto* light = new tsl::elm::ListItem(txt::HOME_LIGHT, lightText(g_mic.light));
+    light->setClickListener([](u64) { return false; });
+    list->addItem(light);
+    auto* lightBar = new PickTrackBar(13, pick, LIGHT_STEPS);
+    lightBar->setProgress(lightStep(g_mic.light));
+    lightBar->setValueChangedListener([light](u16 step) {
+        g_mic.light = lightOf(step);
+        light->setValue(lightText(g_mic.light));
+        g_mic.send();
+    });
+    list->addItem(lightBar);
     return level;
 }
 

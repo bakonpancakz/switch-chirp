@@ -27,8 +27,10 @@ and can share the game, picture and sound, as a Go Live stream.
   you hear, saved in `config/sys-chirp/people.ini`.
 - **Settings:** the mic's **Input Volume** (0–200%), **Input Sensitivity**
   (Automatic, or -80 to -15 dB, with the mic's level shown live beside the
-  line to pick it by), **Automatic Gain Control** and **Noise Suppression**, kept in
-  `settings.ini`; then **Debug: Connection** (the voice servers, their pings,
+  line to pick it by), **Automatic Gain Control**, **Noise Suppression** and
+  **HOME Button Light** (Off, or the light's 15 levels, 7–100%: the HOME button's ring on
+  every connected Pro Controller and right Joy-Con lights up while what you
+  say is being sent; not on a Switch Lite), kept in `settings.ini`; then **Debug: Connection** (the voice servers, their pings,
   the call's elapsed time), **Debug: Sound** (people followed, decoders in
   use, the mic's gain) and **Debug: Memory**.
 - **Hearing:** each person's Opus packets go through a small jitter buffer
@@ -149,7 +151,7 @@ bells` makes the plain bell chimes instead.
 
 Everything the sysmodule keeps is in fixed tables and buffers. Nothing is
 allocated as it runs, so its memory is known at build time
-(`aarch64-none-elf-size chirp.elf`), about 5.8 MB in all. That needs more room than stock
+(`aarch64-none-elf-size chirp.elf`), about 6.2 MB in all. That needs more room than stock
 Atmosphère gives sysmodules on firmware 20 to 22 (7 MB extra on 21+, shared by all of them; on
 22.5.0, 1 MB was left in a game before v0.2). Firmware 23.0.0+ with Atmosphère 1.12.1 gives 40 MB.
 On 22.x, raise `ExtraSystemMemoryForAtmosphere_21_0_0` in mesosphere's
@@ -158,7 +160,7 @@ On 22.x, raise `ExtraSystemMemoryForAtmosphere_21_0_0` in mesosphere's
 | | |
 | --- | --- |
 | code and constants (RNNoise v0.2's weights are 3.2 MB of it) | ~3.6 MB |
-| grc:d's buffer (its biggest keyframe) and the queue of frames being sent (enough for 8 Mbps) | 600 KB |
+| grc:d's buffer (its biggest keyframe) and the queue of frames being sent (768 KB: 10 Mbps with room for spikes) | ~1.1 MB |
 | two voice connections (the call's and the stream's): DAVE's MLS state and room for a Welcome each | ~380 KB |
 | the lists (`store.cpp`), the mixer, the mic | ~200 KB |
 | heap, for what libnx hands the system (the sockets' buffers, 87 KB; four hardware Opus decoders, 48 KB each) and the threads' stacks | 608 KB |
@@ -172,8 +174,9 @@ On 22.x, raise `ExtraSystemMemoryForAtmosphere_21_0_0` in mesosphere's
   stream's own server.
 - **Screenshare** comes in three parts.
   - **Capture** (`screen.cpp`) reads grc:d. Video is asked for only while a
-    title runs that allows video capture: a game, or sphaira and whatever
-    runs in it. It also waits a couple of seconds after the title opens. A
+    title runs: a game, or sphaira and whatever runs in it (its video
+    capture setting isn't checked: an installer's patch may lift it). It
+    also waits a couple of seconds after the title opens. A
     request made while nothing records is never answered, and was stuck
     until a restart.
   - **The send queue** (`framequeue.cpp`) and **the recorder's clocks**

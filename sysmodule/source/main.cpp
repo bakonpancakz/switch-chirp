@@ -18,8 +18,9 @@
 // Opus decoders (48 KB each), the threads' stacks (104 KB), and libnx's own (lookups, files, ssl: more than it
 // looks; 384 KB left no room for even one decoder). chirp.log's system: lines say how much is in use.
 // 608 KB since Go Live: the stream's connection (its stack, 40 KB) and a bigger socket pool (+53 KB) left
-// 480 KB with no room for the screen's threads
-#define INNER_HEAP_SIZE 0x98000
+// 480 KB with no room for the screen's threads.
+// 776 KB since UDP's send buffer went from 9 to 64 KB: the socket pool grew by (64 - 9) x 3 = 165 KB, plus a page
+#define INNER_HEAP_SIZE 0xC2000
 
 extern "C" {
 
@@ -159,7 +160,7 @@ bool handle() {
                 reply(ERR_BAD_ARGS, nullptr, 0);
                 break;
             }
-            app::setMic(m.volume, m.sensitivity, m.agc != 0, m.denoise != 0);
+            app::setMic(m.volume, m.sensitivity, m.agc != 0, m.denoise != 0, m.home_light);
             reply(0, nullptr, 0);
             break;
         }

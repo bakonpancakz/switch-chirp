@@ -34,7 +34,7 @@ void setUserVolume(u64 user, int volume);
 void soundCheck(bool on);
 void setVolume(int volume);  // everything Chirp plays: 0..200 (percent)
 // The mic: input volume (0..200 percent), sensitivity (0 automatic, else dBFS), automatic gain
-void setMic(int volume, int sensitivity, bool agc, bool denoise);
+void setMic(int volume, int sensitivity, bool agc, bool denoise, int home_light);
 bool debug(ChirpDebug* d);  // how things are underneath, for the Debug page
 void reload();
 

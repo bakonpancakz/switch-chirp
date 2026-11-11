@@ -33,6 +33,31 @@ size_t rtpSeal(RtpMode mode, const uint8_t key[RTP_KEY], uint32_t* counter, uint
 size_t rtpSealAs(RtpMode mode, const uint8_t key[RTP_KEY], uint32_t* counter, uint8_t type, bool marker, uint16_t seq,
                  uint32_t timestamp, uint32_t ssrc, const uint8_t* payload, size_t payload_n, uint8_t* out);
 
+// --- RTCP: viewers' feedback on our video ---
+// A received RTCP packet (it may be several, one after another). In the rtpsize modes its first 8 bytes
+// (the first one's header and sender SSRC) are the AAD and the rest is sealed as RTP's is. Opened into
+// out (at least n bytes), header and all: its length, or 0 if it didn't open
+size_t rtcpOpen(RtpMode mode, const uint8_t key[RTP_KEY], const uint8_t* pkt, size_t n, uint8_t* out);
+
+struct RtcpFeedback {
+    uint32_t nacks;  // lost-packet reports (Generic NACK, RFC 4585)
+    uint32_t lost;   // the sequence numbers they named (more than fit in lost[] too)
+    uint32_t keyframes;  // keyframe requests (PLI, FIR)
+    uint32_t remb;   // receivers' bandwidth estimates (they want nothing)
+    uint32_t other;  // reports and the rest
+};
+// What an opened RTCP packet says about media_ssrc's video: the sequence numbers reported lost go in
+// lost[] (max at most; how many returned), the rest counted in *fb. Stops at anything malformed
+size_t rtcpFeedback(const uint8_t* p, size_t n, uint32_t media_ssrc, uint16_t* lost, size_t max, RtcpFeedback* fb);
+
+// One of ours: a Sender Report (RFC 3550) for ssrc, so viewers can line its RTP timestamps up with the
+// other streams': at wall-clock time wall_ns (any clock, the same for every stream), the stream was at
+// rtp_ts; and what it has sent. Sealed as rtcpOpen() opens (*counter incremented first, as rtpSeal's).
+// out: RTCP_SR_SIZE bytes; its length returned
+#define RTCP_SR_SIZE (8 + 20 + 16 + 4)
+size_t rtcpSenderReport(RtpMode mode, const uint8_t key[RTP_KEY], uint32_t* counter, uint32_t ssrc, uint64_t wall_ns,
+                        uint32_t rtp_ts, uint32_t packets, uint32_t octets, uint8_t* out);
+
 // --- H.264 (RFC 6184) ---
 #define RTP_H264 101
 #define RTP_H264_CLOCK 90000

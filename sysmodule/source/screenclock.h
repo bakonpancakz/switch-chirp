@@ -18,9 +18,19 @@ public:
     // bigger step is frames we never read. *gap_us: the step (0: the first, or none). Call after recorded()
     uint32_t missed(uint64_t ts_us, uint64_t* gap_us);
 
+    // Any recorder time (us) on our clock (ns), by the offset recorded() set last; false before it has
+    // set one. (The sound's timestamps are the same clock's: so the sound is lined up with the video.
+    // Read from the sound's thread: atomic)
+    bool toLocal(uint64_t ts_us, uint64_t* ns) const {
+        if (!__atomic_load_n(&have_, __ATOMIC_ACQUIRE)) return false;
+        *ns = (uint64_t)((int64_t)(ts_us * 1000) + __atomic_load_n(&offset_ns_, __ATOMIC_RELAXED));
+        return true;
+    }
+
 private:
     uint64_t last_ts_ = 0, min_gap_ = 0;
     int64_t offset_ns_ = 0;
+    bool have_ = false;
 };
 
 // The game's sound: where each 1024-frame chunk (48 kHz) belongs by the recorder's clock. A chunk read

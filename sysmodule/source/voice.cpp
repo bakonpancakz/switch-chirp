@@ -153,6 +153,12 @@ public:
     Link* link = nullptr;
     bool stream = false;  // (Go Live's connection: see Link)
     uint32_t asent = 0, aunsent = 0;  // (the game's sound)
+    // (for the Sender Reports, which line the sound up with the pictures for viewers: the sound's last RTP
+    // timestamp and when it was recorded (system ns, 0: none yet); what each stream has sent; when next)
+    uint32_t a_rtp_last = 0;
+    uint64_t a_ns_last = 0, next_sr = 0;
+    uint32_t a_pkts_total = 0, a_octets_total = 0, v_pkts_total = 0, v_octets_total = 0;
+    void senderReports();
     // the screen's video: what to send (share.h); sendFrame() sends it
     share::Video video{&g_frames, &g_loading, this};
 
@@ -173,7 +179,17 @@ public:
     uint64_t vstart = 0;
     bool video_on = false;  // (announced as active: op 12)
     uint32_t vsent = 0, vbytes = 0;  // (video packets sent, and their bytes)
-    uint32_t nacks = 0, plis = 0;  // (viewers' RTCP: lost packets to send again, keyframes wanted)
+    // (viewers' RTCP: reports of lost packets and the packets they named; keyframes wanted; bandwidth
+    // estimates; RTCP that didn't open. Counted only: Discord passed no lost-packet reports on, so
+    // sending packets again (RTX) did nothing, and was taken out)
+    uint32_t nacks = 0, lost = 0, plis = 0, rembs = 0, rtcp_unopened = 0;
+    uint64_t last_out_ms = 0;                 // (when the last frame finished going out)
+    uint32_t out_apart_max = 0, out_late = 0;  // (the longest between two; how many came over 25 ms after the last)
+    uint64_t send_t0 = 0;
+    // (the longest a frame took to send; the oldest one when its sending began; the biggest)
+    uint32_t send_ms_max = 0, age_ms_max = 0, frame_max = 0;
+    // (the slowest's time in DAVE's encryption, waiting for room in the socket, and its packets)
+    uint32_t slow_dave_us = 0, slow_blocked_us = 0, slow_seal_us = 0, slow_packets = 0;
     RtpMode mode = Rtp_None;
     uint8_t key[RTP_KEY];
     uint32_t keepalive = 0;
@@ -519,6 +535,27 @@ void Session::sendAudio() {
     }
 }
 
+// A Sender Report for the video and one for the game's sound, about once a second: each says which of its
+// RTP timestamps is now, on one wall clock (the system's), so viewers' players can line the sound up with
+// the pictures. (Without them each stream was played as it came, in step only by luck.) The video's
+// timestamps are its frames' recorded times on the system's clock already; the sound's packets carry
+// theirs (screen.h), from the same recorder clock
+void Session::senderReports() {
+    uint8_t sr[RTCP_SR_SIZE];
+    uint64_t now_ns = armTicksToNs(armGetSystemTick());
+    if (v_pkts_total) {
+        uint32_t v_rtp = vts + (uint32_t)((now_ns - armTicksToNs(vstart)) * 9 / 100000);  // (90 kHz, as sendFrame's)
+        size_t m = rtcpSenderReport(mode, key, &out_counter, vssrc, now_ns, v_rtp, v_pkts_total, v_octets_total, sr);
+        ::send(udp, sr, m, 0);
+    }
+    if (a_ns_last && a_pkts_total) {
+        int64_t since = (int64_t)(now_ns - a_ns_last);
+        uint32_t a_rtp = a_rtp_last + (uint32_t)(since * 48000 / 1'000'000'000LL);  // (48 kHz)
+        size_t m = rtcpSenderReport(mode, key, &out_counter, ssrc, now_ns, a_rtp, a_pkts_total, a_octets_total, sr);
+        ::send(udp, sr, m, 0);
+    }
+}
+
 // The game's sound (screen.h): DAVE-encrypted, sealed in RTP, sent; its timestamp follows the
 // recorder's 20 ms frames
 void Session::sendGameAudio() {
@@ -529,7 +566,9 @@ void Session::sendGameAudio() {
         size_t n = 0;
         if (dave.encrypt(ap.data, ap.n, frame, sizeof(frame), &n)) {
             out_seq++;
-            size_t m = rtpSeal(mode, key, &out_counter, out_seq, out_ts + ap.frame * 960, ssrc, frame, n, pkt);
+            uint32_t rtp_ts = out_ts + ap.frame * 960;
+            size_t m = rtpSeal(mode, key, &out_counter, out_seq, rtp_ts, ssrc, frame, n, pkt);
+            if (ap.ns) a_rtp_last = rtp_ts, a_ns_last = ap.ns;  // (where the sound is on the video's clock: the Sender Reports)
             // (the socket's buffer may be full of video: a moment's wait for room, not a packet lost)
             bool ok = false;
             for (int tries = 0; tries < 4; tries++) {
@@ -541,7 +580,7 @@ void Session::sendGameAudio() {
                 pollfd w = {udp, POLLOUT, 0};
                 poll(&w, 1, 5);
             }
-            if (ok) asent++;
+            if (ok) asent++, a_pkts_total++, a_octets_total += (uint32_t)n;
             else aunsent++;
         } else
             aunsent++;
@@ -563,39 +602,102 @@ void Session::announceVideo(bool on) {
 // each sealed and sent. (The socket's send buffer is small: when it's full, a moment's wait for room; a
 // frame that can't get through is given up on: false)
 bool Session::sendFrame(uint8_t* frame, size_t n, size_t cap, uint64_t tick) {
+    send_t0 = nowMs();
+    uint64_t now_t = armGetSystemTick();
+    uint32_t age = now_t > tick ? (uint32_t)(armTicksToNs(now_t - tick) / 1000000) : 0;
+    if (age > age_ms_max) age_ms_max = age;  // (since the recorder recorded it: its wait in grc and our queue)
+    if (n > frame_max) frame_max = (uint32_t)n;
     size_t out_n = 0;
+    uint64_t d0 = armGetSystemTick();
     if (!dave.encryptVideo(frame, n, cap, &out_n)) return false;
+    uint64_t dave_ticks = armGetSystemTick() - d0, blocked_ticks = 0, seal_ticks = 0;
+    uint32_t packets = 0;
     uint32_t ts = vts + (uint32_t)(armTicksToNs(tick - vstart) * 9 / 100000);  // (90 kHz)
-    static uint8_t scratch[1100], pkt[1100 + RTP_OVERHEAD];
+    // (not paced: as fast as the socket takes them. Paced at 24 Mbps, then 40, a keyframe held the frames
+    // behind it 60 ms, once a second, and viewers saw the frame rate judder though every frame was sent.
+    // And not one send() a packet: each is a call into the system's sockets (bsd), ~0.3 ms, and a 200-packet
+    // keyframe took 70 ms though the socket never once was full. Sealed into a batch of BATCH, sent with
+    // one sendmmsg(): one call for them all)
+    constexpr unsigned BATCH = 16;
+    constexpr size_t PKT = 1100 + RTP_OVERHEAD;
+    static uint8_t scratch[1100], pkts[BATCH][PKT];
+    static iovec iov[BATCH];
+    static mmsghdr msgs[BATCH];
+    static bool no_mmsg = false;  // (sendmmsg refused: one send() a packet, as before)
+    unsigned queued = 0;
     bool gave_up = false;
-    rtpH264Payloads(frame, out_n, sizeof(scratch), scratch, [&](const uint8_t* p, size_t k, bool last) {
-        if (gave_up) return;
-        sendGameAudio();  // (the sound between video packets: a keyframe takes a while to get out)
-        size_t m = rtpSealAs(mode, key, &out_counter, RTP_H264, last, vseq++, ts, vssrc, p, k, pkt);
-        // (at a steady 24 Mbps at most, not as fast as the socket takes them: a keyframe in one burst kept
-        // the Wi-Fi busy, and the call's voices came in late and in clumps meanwhile. 16 was too few: grc's
-        // 10 Mbps peaks at 12-15 in busy scenes, keyframes on top, and the queue filled)
-        constexpr uint64_t PACE_BYTES_PER_S = 3'000'000;
-        static uint64_t pace_ns = 0;
-        uint64_t now_ns = armTicksToNs(armGetSystemTick());
-        if (pace_ns < now_ns) pace_ns = now_ns;
-        pace_ns += (uint64_t)m * 1'000'000'000ULL / PACE_BYTES_PER_S;
-        if (pace_ns > now_ns + 2'000'000) svcSleepThread((s64)(pace_ns - now_ns));
-        for (int tries = 0;; tries++) {
-            if (::send(udp, pkt, m, 0) == (ssize_t)m) break;
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+    // The batch out. (The socket's send buffer (app.cpp's: 64 KB) full: a moment's wait for room, up to
+    // SEND_PATIENCE_MS: capture's queue holds the frames meanwhile. Given up on: the whole frame, false)
+    auto flush = [&]() {
+        constexpr uint64_t SEND_PATIENCE_MS = 250;
+        unsigned done = 0;
+        uint64_t w0 = 0;
+        while (done < queued) {
+            int sent;
+            if (!no_mmsg) {
+                sent = sendmmsg(udp, msgs + done, queued - done, 0);
+                if (sent < 0 && (errno == ENOSYS || errno == EOPNOTSUPP || errno == EINVAL) && !done) {
+                    no_mmsg = true;
+                    say("screen: sendmmsg isn't there (errno %d): a send() a packet", errno);
+                    continue;
+                }
+            } else {
+                sent = ::send(udp, iov[done].iov_base, iov[done].iov_len, 0) == (ssize_t)iov[done].iov_len ? 1 : -1;
+            }
+            if (sent > 0) {
+                for (int i = 0; i < sent; i++) {
+                    vbytes += (uint32_t)iov[done + i].iov_len;
+                    v_octets_total += (uint32_t)(iov[done + i].iov_len - RTP_OVERHEAD);
+                }
+                done += (unsigned)sent, vsent += (uint32_t)sent, v_pkts_total += (uint32_t)sent;
+                continue;
+            }
+            if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS) {
+                gave_up = true;
+                return;
+            }
+            uint64_t t = armTicksToNs(armGetSystemTick());
+            if (!w0) w0 = t;
+            else if (t - w0 >= SEND_PATIENCE_MS * 1'000'000ULL) {
                 gave_up = true;
                 return;
             }
             pollfd w = {udp, POLLOUT, 0};
-            if (tries >= 10 || poll(&w, 1, 5) <= 0) {
-                gave_up = true;
-                return;
-            }
+            if (poll(&w, 1, 10) <= 0) svcSleepThread(1'000'000LL);  // (ENOBUFS isn't polled for: a moment's rest)
         }
-        vsent++;
-        vbytes += (uint32_t)m;
+        if (w0) blocked_ticks += armGetSystemTick() - armNsToTicks(w0);
+        queued = 0;
+    };
+    rtpH264Payloads(frame, out_n, sizeof(scratch), scratch, [&](const uint8_t* p, size_t k, bool last) {
+        if (gave_up) return;
+        uint64_t s0 = armGetSystemTick();
+        size_t m = rtpSealAs(mode, key, &out_counter, RTP_H264, last, vseq++, ts, vssrc, p, k, pkts[queued]);
+        seal_ticks += armGetSystemTick() - s0;
+        iov[queued] = {pkts[queued], m};
+        msgs[queued] = {};
+        msgs[queued].msg_hdr.msg_iov = &iov[queued];
+        msgs[queued].msg_hdr.msg_iovlen = 1;
+        queued++, packets++;
+        if (queued == BATCH || last) {
+            flush();
+            sendGameAudio();  // (the sound between batches: a keyframe takes a while to get out)
+        }
     });
+    if (queued && !gave_up) flush();
+    if (!gave_up) {  // (how evenly frames leave: what viewers' "frame rate (network)" sees)
+        uint64_t t = nowMs();
+        if (t - send_t0 > send_ms_max) {  // (the slowest: where its time went)
+            send_ms_max = (uint32_t)(t - send_t0);
+            slow_dave_us = (uint32_t)(armTicksToNs(dave_ticks) / 1000);
+            slow_blocked_us = (uint32_t)(armTicksToNs(blocked_ticks) / 1000);
+            slow_seal_us = (uint32_t)(armTicksToNs(seal_ticks) / 1000);
+            slow_packets = packets;
+        }
+        uint32_t apart = last_out_ms ? (uint32_t)(t - last_out_ms) : 0;
+        last_out_ms = t;
+        if (apart > out_apart_max) out_apart_max = apart;
+        if (apart > 25) out_late++;  // (more than a frame and a half after the one before)
+    }
     return !gave_up;
 }
 
@@ -608,8 +710,15 @@ void Session::udpPackets(uint64_t now) {
         if (!described || n < 12) continue;
         if (in[1] >= 200 && in[1] <= 206) {  // (RTCP: reports, and viewers' feedback on our video; nothing to play)
             rtcp++;
-            if (in[1] == 205) nacks++;       // (transport feedback: packets that didn't arrive)
-            else if (in[1] == 206) plis++;   // (payload feedback: a keyframe wanted)
+            if (!stream) continue;
+            // (sealed as RTP is, past its first 8 bytes; one that doesn't open is read as it came, in case
+            // it was sent plain: rtcpFeedback stops at anything that doesn't parse)
+            uint8_t opened[2048];
+            size_t on = rtcpOpen(mode, key, in, (size_t)n, opened);
+            if (!on) rtcp_unopened++;
+            RtcpFeedback fb = {};
+            rtcpFeedback(on ? opened : in, on ? on : (size_t)n, vssrc, nullptr, 0, &fb);
+            nacks += fb.nacks, lost += fb.lost, plis += fb.keyframes, rembs += fb.remb;
             continue;
         }
         if (stream) continue;  // (nothing to hear on a stream)
@@ -664,7 +773,7 @@ uint16_t runSession(Link& L, uint32_t serial) {
     s.bin = L.bin;
     s.asent = s.aunsent = 0;
     s.cpu_at = 0;
-    s.video.reset(nowMs());
+    s.video.reset(nowMs());  // (late frames are sent all the same: setStale() isn't used)
     s.identified = s.described = false;
     s.acked = true;
     s.unacked = 0, s.dead = false;
@@ -683,7 +792,10 @@ uint16_t runSession(Link& L, uint32_t serial) {
     mutexUnlock(&g_mls);
     s.vssrc = s.vrtx = 0;
     s.video_on = false;
-    s.vsent = s.vbytes = s.nacks = s.plis = 0;
+    s.vsent = s.vbytes = s.nacks = s.lost = s.plis = s.rembs = s.rtcp_unopened = 0;
+    s.last_out_ms = 0, s.out_apart_max = s.out_late = 0;
+    s.a_rtp_last = 0, s.a_ns_last = 0, s.next_sr = 0;
+    s.a_pkts_total = s.a_octets_total = s.v_pkts_total = s.v_octets_total = 0;
     g_rnd(&s.vseq, sizeof(s.vseq));
     g_rnd(&s.vts, sizeof(s.vts));
     s.vstart = armGetSystemTick();
@@ -719,7 +831,10 @@ uint16_t runSession(Link& L, uint32_t serial) {
         // (something already in the TLS layer: a moment only, but always a wait, as part of a record
         // reads as nothing yet and this loop would otherwise go round without letting anyone else run)
         // (while the mic records, a packet is ready every 20 ms: looked for every 5)
-        poll(p, s.udp >= 0 ? 2 : 1, s.tls.pending() ? 1 : (mic::active() || screen::active()) ? 5 : WAIT_MS);
+        // (and while the screen's shared, every 1: a frame comes every 16.7 ms, and one waiting up to 5 ms
+        // here to be sent arrived as unevenly)
+        poll(p, s.udp >= 0 ? 2 : 1,
+             s.tls.pending() || (s.stream && screen::active()) ? 1 : (mic::active() || screen::active()) ? 5 : WAIT_MS);
         now = nowMs();
         alive = s.ws.poll(0, &s) && !s.dead;
         if (s.udp >= 0) s.udpPackets(now);
@@ -734,6 +849,10 @@ uint16_t runSession(Link& L, uint32_t serial) {
                 // (frames queued behind a keyframe: a few at once, the sound between)
                 for (int k = 0; on && k < 4 && s.video.step(now, armGetSystemTick()); k++) s.sendGameAudio();
                 s.sendGameAudio();
+                if (on && now >= s.next_sr) {
+                    s.senderReports();
+                    s.next_sr = now + 1000;
+                }
             }
         }
         if (s.interval && now >= s.next_beat) s.heartbeat(now);
@@ -761,14 +880,23 @@ uint16_t runSession(Link& L, uint32_t serial) {
             share::Video::Stats vs;
             s.video.takeStats(&vs);
             say("screen: %s, %u frames captured, %u sent (%u keyframes) in %u packets (%u KB), %u not sent; %u loading screens "
-                "or grey; %u skipped waiting for a keyframe", sc.no_game ? "waiting for a title that records" : sc.open ? "capturing" : "not capturing",
-                sc.captured, vs.sent, vs.keyframes, s.vsent, s.vbytes / 1024, vs.failed, vs.placeholders, vs.waited);
+                "or grey; %u too late (skipped), %u skipped waiting for a keyframe", sc.no_game ? "waiting for a title that records" : sc.open ? "capturing" : "not capturing",
+                sc.captured, vs.sent, vs.keyframes, s.vsent, s.vbytes / 1024, vs.failed, vs.placeholders, vs.stale, vs.waited);
             say("screen: grc:d %u failures (0x%X); its longest wait for a frame %u ms (waiting now: %u ms), for sound %u ms (now: "
                 "%u ms); %u sound chunks read", sc.failed, sc.last_rc, sc.video_longest_ms, sc.video_waiting_ms, sc.audio_longest_ms,
                 sc.audio_waiting_ms, sc.audio_chunks);
-            say("screen: viewers asked %u times for lost packets, %u for keyframes; game sound: %u packets sent (%u not), %u dropped "
-                "waiting, %u gaps", s.nacks, s.plis, s.asent, s.aunsent, sc.audio_dropped, sc.audio_holes);
-            s.vsent = s.vbytes = s.nacks = s.plis = 0;
+            say("screen: viewers reported %u packets lost (in %u reports); %u keyframe requests, %u bandwidth estimates, "
+                "%u RTCP didn't open", s.lost, s.nacks, s.plis, s.rembs, s.rtcp_unopened);
+            say("screen: game sound: %u packets sent (%u not), %u dropped waiting, %u gaps", s.asent, s.aunsent,
+                sc.audio_dropped, sc.audio_holes);
+            say("screen: frames went out up to %u ms apart; %u times over 25 ms after the one before; the slowest took %u ms "
+                "to send, the biggest %u KB; the oldest was %u ms old when its sending began", s.out_apart_max, s.out_late,
+                s.send_ms_max, s.frame_max / 1024, s.age_ms_max);
+            say("screen: the slowest frame: %u packets; %u us in DAVE's encryption, %u us sealing, %u us waiting for room "
+                "in the socket, the rest sending", s.slow_packets, s.slow_dave_us, s.slow_seal_us, s.slow_blocked_us);
+            s.vsent = s.vbytes = s.nacks = s.lost = s.plis = s.rembs = s.rtcp_unopened = 0;
+            s.out_apart_max = s.out_late = s.send_ms_max = s.age_ms_max = s.frame_max = 0;
+            s.slow_dave_us = s.slow_blocked_us = s.slow_seal_us = s.slow_packets = 0;
             s.asent = s.aunsent = 0;
             s.next_stats = now + STATS_MS;
         }

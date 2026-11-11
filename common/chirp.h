@@ -43,7 +43,7 @@ enum ChirpCmd {
     ChirpCmd_SetRichPresence = 15, // in u32 0/1: "Playing <the game>" on the bot (kept in settings.ini)
     ChirpCmd_ListLogins = 16,     // out buffer ChirpLogin[] (token.ini's names); out ChirpListed
     ChirpCmd_SetLogin = 17,       // in ChirpLogin: connect as that bot from now on
-    ChirpCmd_SetMic = 18,         // in ChirpMic: input volume, sensitivity, automatic gain, noise suppression (kept in settings.ini)
+    ChirpCmd_SetMic = 18,         // in ChirpMic: input volume, sensitivity, automatic gain, noise suppression, HOME light (kept in settings.ini)
     ChirpCmd_GetDebug = 19,       // out buffer ChirpDebug
     ChirpCmd_SetFullRange = 20,   // in u32 0/1: label the screen's video full range (kept in settings.ini)
     ChirpCmd_SetInvisible = 21,   // in u32 0/1: the bot appears offline while connected (kept in settings.ini)
@@ -51,7 +51,7 @@ enum ChirpCmd {
 
 // Raised when the commands change. The overlay says so when the sysmodule
 // running is older (it's only loaded again when the Switch restarts).
-#define CHIRP_PROTOCOL 10
+#define CHIRP_PROTOCOL 11
 
 enum ChirpConn {
     ChirpConn_NoToken = 0,     // no token.txt (or it's empty)
@@ -106,7 +106,8 @@ typedef struct ChirpStatus {
     uint8_t full_range;         // the screen's video labelled full range: 0/1
     uint8_t invisible;          // the bot appears offline: 0/1
     uint8_t rich_presence;      // "Playing <the game>": 0/1
-    uint8_t pad3[3];
+    uint8_t mic_home_light;     // the HOME button's light while talking: 0 off, else 10..100 (percent)
+    uint8_t pad3[2];
     char game[CHIRP_NAME];      // what Rich Presence says it's playing (empty: nothing)
 } ChirpStatus;
 
@@ -115,7 +116,8 @@ typedef struct ChirpMic {
     int8_t sensitivity;  // 0: automatic; else dBFS (< 0)
     uint8_t agc;         // 0/1
     uint8_t denoise;     // 0/1: noise suppression (RNNoise)
-    uint8_t pad[3];
+    uint8_t home_light;  // the HOME button's light while talking: 0 off, else 10..100 (percent)
+    uint8_t pad[2];
 } ChirpMic;
 
 // How things are underneath, for the overlay's Debug page

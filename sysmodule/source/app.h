@@ -24,7 +24,7 @@ void setSelfDeaf(bool on);
 void setUserMute(uint64_t user, bool on);
 void setUserVolume(uint64_t user, int volume);
 void setScreenShare(bool on);   // (not kept: off at every start)
-void setMic(int volume, int sensitivity, bool agc, bool denoise);  // (the mic's settings: kept in settings.ini)
+void setMic(int volume, int sensitivity, bool agc, bool denoise, int home_light);  // (the mic's settings: kept in settings.ini)
 void debug(ChirpDebug* d);      // (the overlay's Debug page)
 void setFullRange(bool on);     // (the screen's video labelled full range: kept in settings.ini)
 void setInvisible(bool on);     // (the bot offline to everyone while connected: kept in settings.ini)

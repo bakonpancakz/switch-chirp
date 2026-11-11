@@ -6,7 +6,8 @@ uint64_t VideoClock::recorded(uint64_t ts_us, uint64_t now_ns) {
     int64_t mapped = t + offset_ns_;
     int64_t off = (int64_t)now_ns - mapped;
     if (!last_ts_ || mapped <= 0 || off > DRIFT_NS || off < -DRIFT_NS) {
-        offset_ns_ = (int64_t)now_ns - t;
+        __atomic_store_n(&offset_ns_, (int64_t)now_ns - t, __ATOMIC_RELAXED);
+        __atomic_store_n(&have_, true, __ATOMIC_RELEASE);
         mapped = (int64_t)now_ns;
     }
     return (uint64_t)mapped;

@@ -18,6 +18,7 @@
 #include "card.h"
 #include "gateway.h"
 #include "game.h"
+#include "homelight.h"
 #include "mic.h"
 #include "screen.h"
 #include "sounds.h"
@@ -122,6 +123,7 @@ char g_login_active[CHIRP_NAME] = "";  // the one connected as (empty: token.txt
 // the mic's settings (settings.ini): input volume (percent), sensitivity (0 automatic, else dBFS), automatic gain
 int g_mic_volume = 100, g_mic_sensitivity = MIC_SENSITIVITY_AUTO;
 bool g_mic_agc = true, g_mic_denoise = true;
+int g_home_light = 50;  // the HOME button's light while talking: 0 off, else percent
 bool g_full_range = false;  // (the screen's video labelled full range)
 // the bot's presence (settings.ini): invisible (shows offline, the default: not online whenever the
 // Switch is on), and Rich Presence ("Playing <game>"); dirty: say it again
@@ -172,6 +174,7 @@ void loadSettings() {
         else if (!strncmp(line, "input_sensitivity=", 18)) g_mic_sensitivity = !strcmp(line + 18, "auto") ? 0 : atoi(line + 18);
         else if (!strncmp(line, "automatic_gain=", 15)) g_mic_agc = !strcmp(line + 15, "true");
         else if (!strncmp(line, "noise_suppression=", 18)) g_mic_denoise = !strcmp(line + 18, "true");
+        else if (!strncmp(line, "home_light=", 11)) g_home_light = atoi(line + 11);
         else if (!strncmp(line, "full_range_video=", 17)) g_full_range = !strcmp(line + 17, "true");
         else if (!strncmp(line, "appear_invisible=", 17)) g_invisible = !strcmp(line + 17, "true");
         else if (!strncmp(line, "rich_presence=", 14)) g_rpc = !strcmp(line + 14, "true");
@@ -181,7 +184,7 @@ void loadSettings() {
 
 // settings.ini written again (the card's writer thread does, a second after a change: settingsChanged())
 void saveSettings() {
-    char text[512], sens[8];
+    char text[768], sens[8];
     mutexLock(&g_lock);  // (the settings are the IPC thread's to change: a snapshot)
     if (g_mic_sensitivity < 0) snprintf(sens, sizeof(sens), "%d", g_mic_sensitivity);
     else snprintf(sens, sizeof(sens), "auto");
@@ -189,9 +192,10 @@ void saveSettings() {
                      "# Chirp's settings (the overlay changes these)\nlogin=%s\n"
                      "# the mic: volume in percent (0..200); sensitivity auto, or the level talk must be over (dBFS, e.g. -45)\n"
                      "input_volume=%d\ninput_sensitivity=%s\nautomatic_gain=%s\nnoise_suppression=%s\n"
+                     "# the HOME button's light while you talk: 0 off, else its brightness in percent (15 levels: 7, 13, 20 ... 100)\nhome_light=%d\n"
                      "# Screenshare: label the video full range (0..255) rather than grc's limited (16..235)\nfull_range_video=%s\n"
                      "# the bot: offline to everyone while connected; \"Playing <game>\"\nappear_invisible=%s\nrich_presence=%s\n",
-                     g_login, g_mic_volume, sens, g_mic_agc ? "true" : "false", g_mic_denoise ? "true" : "false",
+                     g_login, g_mic_volume, sens, g_mic_agc ? "true" : "false", g_mic_denoise ? "true" : "false", g_home_light,
                      g_full_range ? "true" : "false", g_invisible ? "true" : "false", g_rpc ? "true" : "false");
     mutexUnlock(&g_lock);
     Card c;
@@ -504,7 +508,7 @@ bool session(const char* token) {
                 game::name(app, name, sizeof(name), &capture);
                 capture_known = capture >= 0;
             }
-            screen::setTitle(app, capture);  // (video's asked for only while one that records runs)
+            screen::setTitle(app);  // (video's asked for only while one runs; its capture setting is only logged)
             // (said when it changes, and again once the capture setting's known)
             if (changed || capture >= 0) {
                 static const char* const CAPTURE[] = {"doesn't allow video capture", "allows video capture on request",
@@ -551,11 +555,13 @@ void netThread(void*) {
             .tcp_rx_buf_size = 0x2000,  // (a GUILD_CREATE can be tens of KB: it's read as it comes, a window at a time)
             .tcp_tx_buf_max_size = 0,
             .tcp_rx_buf_max_size = 0,
-            .udp_tx_buf_size = 0x2400,
+            // (64 KB: ~58 video packets, room for grc's bitrate spikes (1.5x for seconds) and the Wi-Fi's
+            // stalls; 9 KB, ~8 packets, filled in a moment and the stream fell apart above ~6 Mbps)
+            .udp_tx_buf_size = 0x10000,
             .udp_rx_buf_size = 0x4000,  // (voice: read every 5-20 ms; 16 KB holds ~100 packets, for clumps while the stream's busy)
             // (each socket takes its buffers from the pool when it opens: 6 at most, the gateway's, an avatar's,
             // and the call's and the stream's websocket and UDP; 2 was too few once the stream came. The pool
-            // is (tx + rx, TCP and UDP) x 3: 87 KB of the heap, down from 159 with 16 KB to receive)
+            // is (tx + rx, TCP and UDP) x 3: 276 KB of the heap since UDP's send buffer went to 64 KB)
             .sb_efficiency = 3,
             .num_bsd_sessions = 5,  // (calls at once: the gateway, the call, the stream, an avatar; a blocked poll holds one)
             .bsd_service_type = BsdServiceType_Auto,
@@ -581,6 +587,7 @@ void netThread(void*) {
 
     loadSettings();
     mic::setSettings(g_mic_volume, g_mic_sensitivity, g_mic_agc, g_mic_denoise);
+    homelight::setBrightness(g_home_light);
     screen::setFullRange(g_full_range);
     size_t failures = 0;
     char token[128];
@@ -782,6 +789,7 @@ void status(ChirpStatus* s) {
     s->mic_sensitivity = (int8_t)g_mic_sensitivity;
     s->mic_agc = g_mic_agc;
     s->mic_denoise = g_mic_denoise;
+    s->mic_home_light = (uint8_t)g_home_light;
     s->full_range = g_full_range;
     s->invisible = g_invisible;
     s->rich_presence = g_rpc;
@@ -956,13 +964,15 @@ void setScreenShare(bool on) {
     screen::setWanted(on);  // (syncVoice starts or ends the stream)
 }
 
-void setMic(int volume, int sensitivity, bool agc, bool denoise) {
+void setMic(int volume, int sensitivity, bool agc, bool denoise, int home_light) {
     mutexLock(&g_lock);
     g_mic_volume = volume < 0 ? 0 : volume > 200 ? 200 : volume;
     g_mic_sensitivity = sensitivity >= 0 ? MIC_SENSITIVITY_AUTO : sensitivity < -96 ? -96 : sensitivity;
     g_mic_agc = agc;
     g_mic_denoise = denoise;
+    g_home_light = home_light < 0 ? 0 : home_light > 100 ? 100 : home_light;
     mic::setSettings(g_mic_volume, g_mic_sensitivity, g_mic_agc, g_mic_denoise);
+    homelight::setBrightness(g_home_light);
     mutexUnlock(&g_lock);
     settingsChanged();
 }

@@ -338,8 +338,6 @@ void stop() {
 
 void setWanted(bool on) { g_wanted = on; }
 bool wanted() { return g_wanted; }
-void setFullRange(bool on) { g_full_range = on; }
-bool fullRange() { return g_full_range; }
 void setCall(bool on) { g_call = on; }
 
 void setTitle(uint64_t title) {
@@ -364,6 +362,11 @@ bool take(uint8_t** frame, size_t* n, size_t* cap, uint64_t* tick, bool* gap) {
 }
 
 void done() { g_q.done(); }
+
+unsigned recordFps() { return g_vclock.fps(); }
+
+void setFullRange(bool on) { g_full_range = on; }
+bool fullRange() { return g_full_range; }
 
 bool waitWork(uint64_t timeout_ns) {
     // (already something to take: no wait. A frame taken and not yet done() isn't something new)

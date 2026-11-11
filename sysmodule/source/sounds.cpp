@@ -17,7 +17,8 @@ namespace {
 uint32_t le32(const uint8_t* p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 uint16_t le16(const uint8_t* p) { return (uint16_t)(p[0] | p[1] << 8); }
 
-const char* const NAMES[KINDS] = {"voice_join", "voice_leave", "screenshare_join", "screenshare_leave"};
+const char* const NAMES[KINDS] = {"voice_join", "voice_leave", "screenshare_join", "screenshare_leave",
+                                  "stream_start", "stream_stop", "mute", "unmute", "deafen", "undeafen"};
 
 }  // namespace
 
@@ -115,7 +116,7 @@ void load(Kind k) {
     }
     fclose(f);
     if (cut) fadeOut(g_pcm, n, w.rate, 20);
-    if (n) mixer::playSound(g_pcm, n, w.rate);
+    if (n) mixer::playSound(g_pcm, n, w.rate, throughDeaf(k));
 }
 #endif
 

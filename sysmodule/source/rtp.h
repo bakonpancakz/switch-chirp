@@ -81,8 +81,11 @@ size_t rtpH264WithParams(uint8_t* buf, size_t n, size_t cap, H264Params* p, bool
 // count). A viewer's WebRTC rewrites any SPS that doesn't, and DAVE's tag covers the SPS: changed
 // under it, the keyframe no longer opens. Returns the new size (the same bytes when it's already so),
 // 0 if it can't be read (sent as it is, then). out: cap bytes, not the input
-// full_range: its video_full_range_flag set (0 limited, 1 full) where the VUI has one; -1 left as it is
-size_t h264FixSps(const uint8_t* sps, size_t n, uint8_t* out, size_t cap, int full_range = -1);
+// full_range: its video_full_range_flag set (0 limited, 1 full) where the VUI has one; -1 left as it is.
+// range_found (if given): what the flag was (0 limited, 1 full; -1 none: no VUI, or no video signal type)
+size_t h264FixSps(const uint8_t* sps, size_t n, uint8_t* out, size_t cap, int full_range = -1, int* range_found = nullptr);
+// What an SPS (NAL, header byte first) says the video's range is: 0 limited, 1 full, -1 it doesn't say
+int h264SpsRange(const uint8_t* sps, size_t n);
 // A keyframe of plain mid grey, for when the recorder has nothing (no game, or the HOME menu): the kept
 // SPS, a PPS of our own (id 1: CAVLC, simple enough to write a picture by hand), and an IDR picture whose
 // every macroblock is Intra 16x16, DC-predicted, with no residual. For grc's SPS (1280x720, 8-bit

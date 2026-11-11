@@ -24,7 +24,7 @@ void leave();
 void setSelfMute(bool on);
 void setSelfDeaf(bool on);
 void setScreenShare(bool on);  // the game's video into the call
-void setFullRange(bool on);    // its video labelled full range
+void setFullRange(bool on);    // the screen's video labelled full range
 void setInvisible(bool on);    // the bot appears offline while connected
 void setRichPresence(bool on); // "Playing <the game>" on the bot
 std::vector<ChirpLogin> logins();  // token.ini's bots

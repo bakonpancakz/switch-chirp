@@ -29,7 +29,6 @@ fi
 # The noise suppression against xiph's RNNoise v0.2 (in rnnoise-ref/v0.2: the 0.2 release, its own
 # model, built into build3/librnnoise3.a: each of src/{denoise,rnn,nnet,nnet_default,rnnoise_data,
 # rnnoise_tables,parse_lpcnet_weights,pitch,celt_lpc,kiss_fft}.c with gcc -O2).
-# (extras/denoise-v0.1 has the v0.1 code Chirp used before; its reference is build/librnnoise.a)
 if [ -f rnnoise-ref/build3/librnnoise3.a ]; then
     $CXX -O2 -Wno-psabi -o out/denoise_test.exe denoise_test.cpp $S/denoise.cpp $S/fft.cpp rnnoise-ref/build3/librnnoise3.a
     ./out/denoise_test.exe | grep -E "matches|quieter|speed|passed|FAIL"

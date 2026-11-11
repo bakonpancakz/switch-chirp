@@ -17,6 +17,13 @@ public:
     // Frames missed before this one: the timestamps step by a frame's time (the smallest step seen), a
     // bigger step is frames we never read. *gap_us: the step (0: the first, or none). Call after recorded()
     uint32_t missed(uint64_t ts_us, uint64_t* gap_us);
+    // The frame rate the recorder records at: 60 when its frames come about 16.7 ms apart, else 30 (0: not
+    // known yet). Snapped to one of the two: the smallest step seen can be a frame that came early, and
+    // taken as the rate it read 77, and frames sent on time counted as late. (Read from other threads)
+    unsigned fps() const {
+        uint64_t g = __atomic_load_n(&min_gap_, __ATOMIC_RELAXED);
+        return !g ? 0 : g < 25000 ? 60 : 30;
+    }
 
     // Any recorder time (us) on our clock (ns), by the offset recorded() set last; false before it has
     // set one. (The sound's timestamps are the same clock's: so the sound is lined up with the video.

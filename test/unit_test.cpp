@@ -889,8 +889,8 @@ struct FakeFrames : share::Frames {
         *cap = sizeof(ring);
         return ring;
     }
-    void giveBack() override { lent = false; }
     bool fullRange() override { return full; }
+    void giveBack() override { lent = false; }
 };
 
 struct FakeLoading : share::Loading {
@@ -1102,6 +1102,20 @@ static void testSounds() {
         fclose(f);
         CHECK(sounds::wavInfo(head, n, &w) && w.rate == 24000 && w.channels == 1 && w.data_at == 44 && w.data_bytes / 2 <= SOUNDS_MAX);
     }
+    // every kind has its file shipped, and only our own mute and deafen are heard while deafened
+    for (int k = 0; k < sounds::KINDS; k++) {
+        char path[96];
+        snprintf(path, sizeof(path), "../sounds/%s.wav", sounds::name((sounds::Kind)k));
+        FILE* g = fopen(path, "rb");
+        CHECK(g != nullptr);
+        if (g) {
+            uint8_t head[256];
+            size_t n = fread(head, 1, sizeof(head), g);
+            fclose(g);
+            CHECK(sounds::wavInfo(head, n, &w) && w.rate == 24000 && w.data_bytes / 2 <= SOUNDS_MAX);
+        }
+        CHECK(sounds::throughDeaf((sounds::Kind)k) == (k >= sounds::Mute));
+    }
     // stereo, with a chunk before its samples (padded to an even size): found, mixed to mono
     auto st = wavBytes(1, 2, 48000, 16, {1000, 3000, -2000, -4000, 32767, 32767}, true);
     CHECK(sounds::wavInfo(st.data(), st.size(), &w) && w.channels == 2 && w.rate == 48000 && w.data_bytes == 12);
@@ -1213,6 +1227,7 @@ static void testRtcp() {
     CHECK(vc.toLocal(1000, &ns) && ns == 5'000'000'000ULL);
     CHECK(vc.toLocal(21333, &ns) && ns == 5'000'000'000ULL + 20'333'000);
 }
+
 
 int main() {
     srand(1234);

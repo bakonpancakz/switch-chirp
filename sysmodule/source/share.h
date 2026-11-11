@@ -24,7 +24,7 @@ struct Frames {
     // thrown away first. Null: frames are waiting
     virtual uint8_t* borrow(size_t* cap, bool flush) = 0;
     virtual void giveBack() = 0;
-    virtual bool fullRange() = 0;  // (the video labelled full range: screen.h)
+    virtual bool fullRange() = 0;  // (the video labelled full range, whatever the recorder says: screen.h)
 };
 
 // The loading screens: H.264 keyframes on the card
@@ -61,6 +61,9 @@ public:
         uint32_t sent, keyframes, waited, failed, placeholders, stale;
     };
     void takeStats(Stats* out);
+    // The range the video goes out labelled with: full when that's asked for (fullRange()), else as the
+    // recorder's SPS kept says (grc's own until one comes): 0 limited, 1 full, -1 it doesn't say
+    int colorRange() const { return frames_->fullRange() ? 1 : h264SpsRange(params_.sps, params_.sps_n); }
 
 private:
     void placeholder(uint64_t now_ms, uint64_t now_tick, bool flush);

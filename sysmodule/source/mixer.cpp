@@ -158,8 +158,11 @@ const int16_t* g_sound = nullptr;
 size_t g_sound_n = 0;
 int g_sound_rate = 0;
 uint64_t g_sound_pos = 0;
+bool g_sound_through = false;  // (heard while deafened: our own mute and deafen)
 int16_t g_sound_frame[MIXER_FRAME];
-constexpr int SOUND_GAIN = MIXER_UNITY;
+// (a third: -9.5 dB. The sounds are normalized loud, about -15 dBFS RMS, and at x1 they came out louder
+// than the people talking, who sit around -20..-25; a cue should be under the voices, as Discord's are)
+constexpr int SOUND_GAIN = MIXER_UNITY / 3;
 
 void toneFrame(int k, int16_t* f) {
     Tone& t = g_tones[k];
@@ -390,7 +393,7 @@ void fill(Buf& b) {
     if (g_sound) {
         if (!soundFrame(g_sound, g_sound_n, g_sound_rate, &g_sound_pos, g_sound_frame)) g_sound = nullptr;
         frames[n] = g_sound_frame;  // (its last frame, the rest silence, still goes)
-        gains[n++] = g_deaf ? 0 : (SOUND_GAIN * g_master) >> 12;
+        gains[n++] = g_deaf && !g_sound_through ? 0 : (SOUND_GAIN * g_master) >> 12;
     }
     mutexUnlock(&g_lock);
     if (g_voice) {
@@ -560,10 +563,11 @@ void setSoundCheck(bool on) {
 
 bool soundCheck() { return g_check; }
 
-void playSound(const int16_t* pcm, size_t n, int rate) {
+void playSound(const int16_t* pcm, size_t n, int rate, bool through_deaf) {
     mutexLock(&g_lock);
     g_sound = n && rate > 0 ? pcm : nullptr;
     g_sound_n = n, g_sound_rate = rate, g_sound_pos = 0;
+    g_sound_through = through_deaf;
     mutexUnlock(&g_lock);
 }
 

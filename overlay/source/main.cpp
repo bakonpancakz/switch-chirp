@@ -1,13 +1,15 @@
-// Chirp's overlay (libultrahand): the servers the bot is in, their voice
-// channels, who's in them, and joining one. While the bot is in a call,
-// opening the overlay shows the call instead: how long it's been, Mute,
-// Deafen, Leave, and the people in it (each with a mute and a volume that
-// are only ours). Everything comes from the sysmodule (client.cpp).
+// Chirp's overlay (libultrahand). Home: the bot (how it's connected, which bot, Rich Presence) and the
+// servers it's in; a server's voice channels; a channel's people, and joining it. While the bot is in
+// a call, opening the overlay shows the call instead: Mute, Deafen, Screenshare, Volume, Settings,
+// Disconnect, and the people in it (each with a mute and a volume that are only ours). Everything comes
+// from the sysmodule (client.cpp). Lists are sorted by name.
 #define TESLA_INIT_IMPL
 #include <tesla.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <strings.h>
 #include <string>
 #include <vector>
 
@@ -49,14 +51,13 @@ using tsl::Color;
 using tsl::gfx::Renderer;
 
 // Colours from the Ultrahand theme (read when the overlay starts), so this
-// looks like the menu around it; and Discord's blue for "someone's there"
+// looks like the menu around it
 #define WHITE tsl::defaultTextColor
 #define ACCENT tsl::trackBarFullColor
 const Color GREY = Color(0xC, 0xC, 0xC, 0xF);
 const Color DIM = Color(0x8, 0x8, 0x8, 0xF);
 const Color WARN = Color(0xF, 0x6, 0x5, 0xF);
 const Color GOOD = Color(0x5, 0xD, 0x7, 0xF);
-const Color BLUE = Color(0x5, 0x8, 0xF, 0xF);
 
 std::string fmt(const char* f, unsigned v) {
     char s[128];
@@ -85,9 +86,41 @@ std::string stateOf(const ChirpMember& m) {
     return s;
 }
 
-// Us first, then everyone else as the sysmodule has them
-void meFirst(std::vector<ChirpMember>& people) {
-    std::stable_partition(people.begin(), people.end(), [](const ChirpMember& m) { return (m.flags & ChirpMember_Me) != 0; });
+// Names in order, case aside (then as they are, so the order never wobbles)
+bool nameLess(const char* a, const char* b) {
+    int c = strcasecmp(a, b);
+    return c ? c < 0 : strcmp(a, b) < 0;
+}
+
+void byName(std::vector<ChirpMember>& people) {
+    std::stable_sort(people.begin(), people.end(), [](const ChirpMember& a, const ChirpMember& b) { return nameLess(a.name, b.name); });
+}
+
+void byName(std::vector<ChirpGuild>& guilds) {
+    std::stable_sort(guilds.begin(), guilds.end(), [](const ChirpGuild& a, const ChirpGuild& b) { return nameLess(a.name, b.name); });
+}
+
+// A server's channels: the categories as Discord has them, the channels under each by name
+void byName(std::vector<ChirpChannel>& chans) {
+    for (size_t i = 0; i < chans.size();) {
+        if (chans[i].type == ChirpChannel_Category) {
+            i++;
+            continue;
+        }
+        size_t j = i;
+        while (j < chans.size() && chans[j].type != ChirpChannel_Category) j++;
+        std::stable_sort(chans.begin() + i, chans.begin() + j,
+                         [](const ChirpChannel& a, const ChirpChannel& b) { return nameLess(a.name, b.name); });
+        i = j;
+    }
+}
+
+// A value on the right of a row, in the theme's colour ("2 active", "Retry"), ending at right and centred
+// on cy: its left edge, to place what comes before it
+s32 accentValue(Renderer* r, const std::string& text, s32 right, s32 cy) {
+    s32 w = r->getTextDimensions(text, false, 19).first;
+    r->drawString(text, false, right - w, cy + 7, 19, r->a(ACCENT));
+    return right - w;
 }
 
 // A mute or deafen icon (icons.h) at (x, y): the shape in one colour, its slash in another
@@ -286,62 +319,149 @@ class GuildGui;
 class CallGui;
 class LoginGui;
 
-// The bot at the top: its picture and name, and under them how the connection is doing (a dot and a
-// word or two). A on it picks which bot (Select Login)
-class AccountRow : public tsl::elm::Element {
+// A row of Home's Profile: drawn by draw(), A does onA() (when there is one); every row takes the
+// cursor so the list scrolls. key keeps the cursor on it when the page is made again
+class ProfileRow : public tsl::elm::Element {
 public:
-    static constexpr u16 HEIGHT = 72;
-    static constexpr u64 KEY = 3;
-    explicit AccountRow(u64* pick) : pick_(pick) {}
+    static constexpr u16 HEIGHT = 64;
+    ProfileRow(u64 key, u64* pick) : key_(key), pick_(pick) {}
     void layout(u16, u16, u16, u16) override {}
-    tsl::elm::Element* requestFocus(tsl::elm::Element*, tsl::FocusDirection) override { return g_now.running ? this : nullptr; }
-    bool matchesJumpCriteria(const std::string& text, const std::string&, bool) const override { return text == jumpKey(KEY); }
+    tsl::elm::Element* requestFocus(tsl::elm::Element*, tsl::FocusDirection) override { return this; }
+    bool matchesJumpCriteria(const std::string& text, const std::string&, bool) const override { return text == jumpKey(key_); }
     void setFocused(bool f) override {
         Element::setFocused(f);
-        if (f) *pick_ = KEY;
+        if (f) *pick_ = key_;
     }
-    bool onClick(u64 keys) override;
-    void draw(Renderer* r) override {
-        const ChirpStatus& s = g_now.st;
-        std::string name = s.user[0] ? s.user : s.login[0] ? s.login : txt::TITLE, status;
-        Color dot = DIM;
-        if (!g_now.running) {
-            name = txt::ST_NOT_RUNNING, status = txt::ST_NOT_RUNNING_SUB, dot = WARN;
-        } else if (client::outdated()) {
-            status = txt::ST_OUTDATED, dot = WARN;
-        } else if (s.conn == ChirpConn_Online) {
-            dot = GOOD;
-            status = s.invisible ? txt::ST_INVISIBLE : s.game[0] ? fmt(txt::ST_PLAYING, s.game) : std::string(txt::ST_ONLINE);
-            if (s.invisible) dot = DIM;
-        } else if (s.conn == ChirpConn_Connecting) {
-            status = txt::ST_CONNECTING, dot = ACCENT;
-        } else if (s.conn == ChirpConn_Offline) {
-            status = fmt(txt::ST_OFFLINE_SUB, s.retry_in_s), dot = WARN;
-        } else if (s.conn == ChirpConn_BadToken) {
-            status = txt::ST_BAD_TOKEN, dot = WARN;
-        } else if (s.conn == ChirpConn_Refused) {
-            status = fmt(txt::ST_REFUSED, s.last_close), dot = WARN;
-        } else {
-            status = txt::ST_NO_TOKEN_SUB, dot = DIM;
-        }
-        s32 x = getX() + 6, w = getWidth() - 12, cy = getY() + HEIGHT / 2;
-        r->drawRect(x, getY() + HEIGHT - 1, w, 1, r->a(tsl::separatorColor));
-        picture(r, s.avatar, 0, name.c_str(), x + 10 + avatar::SIZE / 2, cy);
-        s32 tx = x + 10 + avatar::SIZE + 14;
-        if (g_now.running) {
-            s32 cw = r->getTextDimensions(txt::CARET, false, 20).first;
-            r->drawString(txt::CARET, false, x + w - 12 - cw, cy + 7, 20, r->a(WHITE));
-        }
-        r->drawString(name, false, tx, cy - 2, 21, r->a(WHITE));
-        r->drawCircle(tx + 5, cy + 15, 5, true, r->a(dot));
-        r->drawString(status, false, tx + 16, cy + 21, 15, r->a(GREY));
+    bool onClick(u64 keys) override {
+        if (!(keys & HidNpadButton_A)) return false;
+        return onA();
+    }
+
+protected:
+    virtual bool onA() { return false; }
+    // (the row's line under it; x, w and cy for what's in it)
+    void frame(Renderer* r, s32* x, s32* w, s32* cy) {
+        *x = getX() + 6, *w = getWidth() - 12, *cy = getY() + HEIGHT / 2;
+        r->drawRect(*x, getY() + HEIGHT - 1, *w, 1, r->a(tsl::separatorColor));
     }
 
 private:
+    u64 key_;
     u64* pick_;
 };
 
-// A server: its icon, its name, how many are in its voice channels, and a caret (A opens it)
+// Little icons drawn from shapes (Ultrahand's font has none), about 26 px, centred on cx, cy: green when
+// it's going, dim when it isn't. Their holes are drawn in the overlay's own dark
+const Color HOLE = Color(0x1, 0x1, 0x1, 0xF);
+
+// A plug, prongs up: the connection
+void plugIcon(Renderer* r, s32 cx, s32 cy, Color c) {
+    r->drawRect(cx - 5, cy - 11, 3, 6, r->a(c));  // (the prongs)
+    r->drawRect(cx + 2, cy - 11, 3, 6, r->a(c));
+    r->drawRoundedRect(cx - 8, cy - 6, 16, 10, 3, r->a(c));  // (the head)
+    r->drawRect(cx - 3, cy + 4, 6, 3, r->a(c));  // (the neck)
+    r->drawRect(cx - 1, cy + 7, 3, 6, r->a(c));  // (the cable)
+}
+
+// A controller, grips down: Rich Presence (the game being played)
+void controllerIcon(Renderer* r, s32 cx, s32 cy, Color c) {
+    r->drawRoundedRect(cx - 13, cy - 7, 26, 12, 5, r->a(c));  // (the body)
+    r->drawCircle(cx - 8, cy + 4, 5, true, r->a(c));            // (the grips)
+    r->drawCircle(cx + 8, cy + 4, 5, true, r->a(c));
+    r->drawRect(cx - 11, cy - 2, 7, 2, r->a(HOLE));  // (the d-pad)
+    r->drawRect(cx - 8, cy - 5, 2, 8, r->a(HOLE));
+    r->drawCircle(cx + 6, cy - 3, 1, true, r->a(HOLE));  // (two buttons)
+    r->drawCircle(cx + 9, cy, 1, true, r->a(HOLE));
+}
+
+// How the connection is: a plug (green: online) and a word or two. A starts a new session now
+class StatusRow : public ProfileRow {
+public:
+    using ProfileRow::ProfileRow;
+    void draw(Renderer* r) override {
+        s32 x, w, cy;
+        frame(r, &x, &w, &cy);
+        const ChirpStatus& s = g_now.st;
+        std::string text;
+        bool retry = g_now.running && s.conn != ChirpConn_Online && s.conn != ChirpConn_Connecting;
+        if (!g_now.running) {
+            text = txt::ST_NOT_RUNNING;
+        } else if (client::outdated()) {
+            text = txt::ST_OUTDATED, retry = false;
+        } else if (s.conn == ChirpConn_Online) {
+            text = s.invisible ? txt::ST_INVISIBLE : txt::ST_ONLINE;
+        } else if (s.conn == ChirpConn_Connecting) {
+            text = txt::ST_CONNECTING;
+        } else if (s.conn == ChirpConn_Offline) {
+            text = fmt(txt::ST_OFFLINE_SUB, s.retry_in_s);
+        } else if (s.conn == ChirpConn_BadToken) {
+            text = txt::ST_BAD_TOKEN;
+        } else if (s.conn == ChirpConn_Refused) {
+            text = fmt(txt::ST_REFUSED, s.last_close);
+        } else {
+            text = txt::ST_NO_TOKEN_SUB;
+        }
+        s32 right = x + w - 12;
+        if (retry) right = accentValue(r, txt::RETRY, right, cy) - 14;
+        plugIcon(r, x + 19, cy, s.conn == ChirpConn_Online && g_now.running && !client::outdated() ? GOOD : DIM);
+        s32 tx = x + 42;
+        r->drawString(fitted(r, text, right - tx, 20), false, tx, cy + 7, 20, r->a(WHITE));
+    }
+
+protected:
+    bool onA() override {
+        if (!g_now.running || client::outdated()) return false;
+        client::reload();
+        return true;
+    }
+};
+
+// The bot: its picture and name. A picks which bot (token.ini's)
+class BotRow : public ProfileRow {
+public:
+    using ProfileRow::ProfileRow;
+    void draw(Renderer* r) override {
+        s32 x, w, cy;
+        frame(r, &x, &w, &cy);
+        const ChirpStatus& s = g_now.st;
+        std::string name = s.user[0] ? s.user : s.login[0] ? s.login : txt::TITLE;
+        picture(r, s.avatar, 0, name.c_str(), x + 10 + avatar::SIZE / 2, cy);
+        s32 right = x + w - 12 - r->getTextDimensions(txt::CARET, false, 20).first;
+        r->drawString(txt::CARET, false, right, cy + 7, 20, r->a(WHITE));  // (as Ultrahand draws it)
+        s32 tx = x + 10 + avatar::SIZE + 14;
+        r->drawString(fitted(r, name, right - 14 - tx, 20), false, tx, cy + 7, 20, r->a(WHITE));
+    }
+
+protected:
+    bool onA() override;
+};
+
+// Rich Presence: a controller (green: showing a game) and the game's name (cut to fit), "(no game open)",
+// or "(disabled)"; A turns it on and off
+class RpcRow : public ProfileRow {
+public:
+    using ProfileRow::ProfileRow;
+    void draw(Renderer* r) override {
+        s32 x, w, cy;
+        frame(r, &x, &w, &cy);
+        const ChirpStatus& s = g_now.st;
+        bool on = s.rich_presence != 0;
+        std::string text = !on ? txt::RPC_OFF : s.game[0] ? s.game : txt::RPC_IDLE;
+        controllerIcon(r, x + 19, cy, on && s.game[0] ? GOOD : DIM);
+        s32 tx = x + 42, right = x + w - 12;
+        r->drawString(fitted(r, text, right - tx, 20), false, tx, cy + 7, 20, r->a(WHITE));
+    }
+
+protected:
+    bool onA() override {
+        bool on = g_now.st.rich_presence == 0;
+        client::setRichPresence(on);
+        g_now.st.rich_presence = on;  // (until the next poll says so too)
+        return true;
+    }
+};
+
+// A server: its icon, its name, and how many are active in its voice channels (A opens it)
 class GuildRow : public tsl::elm::Element {
 public:
     static constexpr u16 HEIGHT = 64;
@@ -359,17 +479,7 @@ public:
         r->drawRect(x, y + HEIGHT - 1, w, 1, r->a(tsl::separatorColor));
         picture(r, g_.icon, g_.id, g_.name, x + 10 + avatar::SIZE / 2, cy);
         s32 right = x + w - 12;
-        s32 cw = r->getTextDimensions(txt::CARET, false, 20).first;
-        right -= cw;
-        r->drawString(txt::CARET, false, right, cy + 7, 20, r->a(WHITE));  // (as Ultrahand draws it)
-        right -= 14;
-        if (g_.in_voice) {
-            std::string v = fmt(txt::IN_VOICE, g_.in_voice);
-            s32 vw = r->getTextDimensions(v, false, 15).first;
-            right -= vw;
-            r->drawString(v, false, right, cy + 6, 15, r->a(BLUE));
-            right -= 12;
-        }
+        if (g_.in_voice) right = accentValue(r, fmt(txt::ACTIVE_N, g_.in_voice), right, cy) - 12;
         s32 tx = x + 10 + avatar::SIZE + 14;
         r->drawString(fitted(r, g_.name, right - tx, 20), false, tx, cy + 7, 20, r->a(WHITE));
     }
@@ -387,22 +497,14 @@ public:
         conn_ = g_now.running ? g_now.st.conn : 0xFF;
         auto* frame = new tsl::elm::OverlayFrame(txt::TITLE, APP_VERSION);
         auto* list = new tsl::elm::List();
-        // (the bot, and how it's connected: A on it picks which bot; key 3, no guild's id)
-        list->addItem(new AccountRow(&g_pick_main), AccountRow::HEIGHT);
-        u8 c = g_now.st.conn;
-        if (g_now.running && c != ChirpConn_Online && c != ChirpConn_Connecting) {
-            auto* again = new tsl::elm::ListItem(txt::RECONNECT);
-            again->setClickListener([again](u64 keys) {
-                if (!(keys & HidNpadButton_A)) return false;
-                client::reload();
-                again->setValue(txt::RECONNECTING);
-                return true;
-            });
-            list->addItem(again);
-        }
-        if (g_now.running && c == ChirpConn_Online) {
+        // (the bot, how it's connected, Rich Presence: keys 1..3, no server's id is that small)
+        if (g_now.running) list->addItem(new BotRow(2, &g_pick_main), ProfileRow::HEIGHT);
+        list->addItem(new StatusRow(1, &g_pick_main), ProfileRow::HEIGHT);
+        if (g_now.running && g_now.st.conn == ChirpConn_Online) {
+            list->addItem(new RpcRow(3, &g_pick_main), ProfileRow::HEIGHT);
             list->addItem(new tsl::elm::CategoryHeader(txt::SERVERS));
             auto guilds = client::guilds();
+            byName(guilds);
             for (const ChirpGuild& g : guilds) list->addItem(new GuildRow(g, &g_pick_main), GuildRow::HEIGHT);
             if (guilds.empty()) list->addItem(new tsl::elm::ListItem(txt::NO_SERVERS));
         }
@@ -420,10 +522,10 @@ private:
 
 // --- a server: its voice channels ---
 
-// A voice channel: its name, and how many are in it under (blue when anyone is)
+// A voice channel: its name, how many are active in it (when anyone is), and a caret (A opens it)
 class ChannelRow : public tsl::elm::ListItem {
 public:
-    ChannelRow(const ChirpChannel& c, u64* pick) : ListItem(c.name), id_(c.id), members_(c.members), pick_(pick) {}
+    ChannelRow(const ChirpChannel& c, u64* pick) : ListItem(c.name, txt::CARET), id_(c.id), members_(c.members), pick_(pick) {}
     // (the list jumps to it, and scrolls to it, when its page is made again: see jumpKey)
     bool matchesJumpCriteria(const std::string& text, const std::string&, bool) const override {
         return text == jumpKey(id_);
@@ -434,9 +536,10 @@ public:
     }
     void draw(Renderer* r) override {
         ListItem::draw(r);
-        std::string sub = members_ == 0 ? txt::MEMBERS_NONE : members_ == 1 ? txt::MEMBERS_ONE : fmt(txt::MEMBERS_MANY, members_);
-        s32 w = r->getTextDimensions(sub, false, 15).first;
-        r->drawString(sub, false, getX() + getWidth() - w - 22, getY() + getHeight() / 2 + 6, 15, r->a(members_ ? BLUE : GREY));
+        if (members_) {  // (before the caret: the value Ultrahand draws, its right edge 22 in)
+            s32 cw = r->getTextDimensions(txt::CARET, false, 20).first;
+            accentValue(r, fmt(txt::ACTIVE_N, members_), getX() + getWidth() - 22 - cw - 12, getY() + getHeight() / 2);
+        }
     }
 
 private:
@@ -473,6 +576,7 @@ public:
         auto* frame = new tsl::elm::OverlayFrame(name_, txt::VOICE_CHANNELS);
         auto* list = new tsl::elm::List();
         auto chans = client::channels(id_);
+        byName(chans);
         bool any = false;
         for (const ChirpChannel& c : chans) {
             if (c.type == ChirpChannel_Category) {
@@ -515,20 +619,20 @@ public:
         serial_ = g_now.st.serial;
         auto* frame = new tsl::elm::OverlayFrame(cname_, gname_);
         auto* list = new tsl::elm::List();
-        for (bool muted : {false, true}) {
-            auto* item = new tsl::elm::ListItem(muted ? txt::JOIN_MUTED : txt::JOIN);
-            u64 g = guild_, c = channel_;
-            item->setClickListener([item, g, c, muted](u64 keys) {
-                if (!(keys & HidNpadButton_A)) return false;
-                client::join(g, c, muted);
-                item->setValue(txt::JOINING);  // (the call shows once Discord says the bot's in)
-                return true;
-            });
-            list->addItem(item);
-        }
+        // (muted or not as the bot last was: the sysmodule keeps that between calls)
+        auto* join = new tsl::elm::ListItem(txt::JOIN, g_now.st.self_mute ? std::string(txt::JOIN_AS_MUTED) + "  " + txt::CARET
+                                                                          : std::string(txt::CARET));
+        u64 g = guild_, c = channel_;
+        join->setClickListener([join, g, c](u64 keys) {
+            if (!(keys & HidNpadButton_A)) return false;
+            client::join(g, c, g_now.st.self_mute != 0);
+            join->setValue(txt::JOINING);  // (the call shows once Discord says the bot's in)
+            return true;
+        });
+        list->addItem(join);
         auto people = client::members(channel_);
-        meFirst(people);
-        list->addItem(new tsl::elm::CategoryHeader(std::string(txt::IN_CHANNEL) + " (" + std::to_string(people.size()) + ")"));
+        byName(people);
+        list->addItem(new tsl::elm::CategoryHeader(fmt(txt::ACTIVE_MEMBERS, (unsigned)people.size())));
         for (const ChirpMember& m : people) list->addItem(new MemberRow(m, &g_pick_channel, nullptr), MemberRow::HEIGHT);
         if (people.empty()) list->addItem(new tsl::elm::ListItem(txt::NOBODY));
         if (g_pick_channel) list->jumpToItem(jumpKey(g_pick_channel));  // (where it was before the list changed)
@@ -610,7 +714,7 @@ tsl::elm::ListItem* addMicSettings(tsl::elm::List* list, u64* pick) {
         g_mic.send();
     });
     list->addItem(sensBar);
-    auto* level = infoRow(list, txt::MIC_LEVEL, "");
+    auto* level = infoRow(list, txt::MIC_LEVEL, "");  // (Input Level: now, and the line talk must be over)
     auto* agc = new PickToggle(txt::AGC, g_mic.agc, 9, pick);
     agc->setStateChangedListener([](bool on) {
         g_mic.agc = on;
@@ -647,9 +751,10 @@ std::string micLevelText(const ChirpDebug& d) {
 
 // How long the bot's been in the call (the seconds counted here between polls, so the clock ticks smoothly)
 u32 callElapsed() { return g_now.st.call_seconds + (u32)((ult::nowNs() - g_now.polled_ns) / 1'000'000'000ULL); }
+std::string connectedFor() { return fmt(txt::CONNECTED_FOR, hms(callElapsed()).c_str()); }
 
-// Settings (from the call page): the mic, then what's underneath, as it is now (Debug: Connection,
-// Sound, Memory), all on the one page
+// Settings (from the call page): the mic, then what's underneath as it is now (Debug: Screenshare,
+// Network, Audio, System), all on the one page
 class SettingsGui : public tsl::Gui {
 public:
     tsl::elm::Element* createUI() override {
@@ -663,20 +768,30 @@ public:
         auto* range = new PickToggle(txt::FULL_RANGE, g_now.st.full_range != 0, 12, &g_pick_settings);
         range->setStateChangedListener([](bool on) { client::setFullRange(on); });
         list->addItem(range);
-        list->addItem(new tsl::elm::CategoryHeader(txt::DBG_CONNECTION));
-        rows_[0] = infoRow(list, txt::DBG_VOICE_SERVER, "");
-        rows_[1] = infoRow(list, txt::DBG_PING, "");
-        rows_[2] = infoRow(list, txt::DBG_STREAM_SERVER, "");
-        rows_[3] = infoRow(list, txt::DBG_STREAM_PING, "");
-        rows_[4] = infoRow(list, txt::IN_CALL_FOR, hms(callElapsed()));
-        list->addItem(new tsl::elm::CategoryHeader(txt::DBG_SOUND));
-        rows_[5] = infoRow(list, txt::DBG_SPEAKERS, "");
-        rows_[6] = infoRow(list, txt::DBG_DECODERS, "");
-        rows_[7] = infoRow(list, txt::DBG_MIC_GAIN, "");
-        list->addItem(new tsl::elm::CategoryHeader(txt::DBG_MEMORY));
-        rows_[8] = infoRow(list, txt::DBG_SYSTEM_FREE, "");
-        rows_[9] = infoRow(list, txt::DBG_CHIRP, "");
-        rows_[10] = infoRow(list, txt::DBG_HEAP, "");
+        list->addItem(new tsl::elm::CategoryHeader(txt::DBG_SCREENSHARE));
+        rows_[R_RANGE] = infoRow(list, txt::DBG_RANGE, "");
+        rows_[R_REC_FPS] = infoRow(list, txt::DBG_REC_FPS, "");
+        rows_[R_FPS] = infoRow(list, txt::DBG_FPS, "");
+        rows_[R_BITRATE] = infoRow(list, txt::DBG_BITRATE, "");
+        rows_[R_LATE] = infoRow(list, txt::DBG_LATE, "");
+        rows_[R_LOST] = infoRow(list, txt::DBG_LOST, "");
+        rows_[R_BIGGEST] = infoRow(list, txt::DBG_BIGGEST, "");
+        list->addItem(new tsl::elm::CategoryHeader(txt::DBG_NETWORK));
+        rows_[R_PING_GW] = infoRow(list, txt::DBG_PING_GATEWAY, "");
+        rows_[R_PING_VOICE] = infoRow(list, txt::DBG_PING_VOICE, "");
+        rows_[R_PING_STREAM] = infoRow(list, txt::DBG_PING_STREAM, "");
+        rows_[R_HOST_VOICE] = infoRow(list, txt::DBG_HOST_VOICE, "");
+        rows_[R_HOST_STREAM] = infoRow(list, txt::DBG_HOST_STREAM, "");
+        list->addItem(new tsl::elm::CategoryHeader(txt::DBG_AUDIO));
+        rows_[R_SPEAKERS] = infoRow(list, txt::DBG_SPEAKERS, "");
+        rows_[R_DECODERS] = infoRow(list, txt::DBG_DECODERS, "");
+        rows_[R_GAIN] = infoRow(list, txt::DBG_MIC_GAIN, "");
+        list->addItem(new tsl::elm::CategoryHeader(txt::DBG_SYSTEM));
+        rows_[R_FREE] = infoRow(list, txt::DBG_SYSTEM_FREE, "");
+        rows_[R_CHIRP] = infoRow(list, txt::DBG_CHIRP, "");
+        rows_[R_HEAP] = infoRow(list, txt::DBG_HEAP, "");
+        rows_[R_CPU] = infoRow(list, txt::DBG_CHIRP_CPU, "");
+        rows_[R_IDLE] = infoRow(list, txt::DBG_CORE3_IDLE, "");
         if (g_pick_settings) list->jumpToItem(jumpKey(g_pick_settings));
         frame->setContent(list);
         refresh();
@@ -689,15 +804,25 @@ public:
             tsl::goBack();
             return;
         }
-        set(4, hms(callElapsed()));  // (every frame: the clock ticks smoothly)
         if (ult::nowNs() - refreshed_ns_ >= POLL_NS) refresh();
     }
 
 private:
-    static constexpr int ROWS = 11;
+    enum {
+        R_RANGE, R_REC_FPS, R_FPS, R_BITRATE, R_LATE, R_LOST, R_BIGGEST,
+        R_PING_GW, R_PING_VOICE, R_PING_STREAM, R_HOST_VOICE, R_HOST_STREAM,
+        R_SPEAKERS, R_DECODERS, R_GAIN,
+        R_FREE, R_CHIRP, R_HEAP, R_IDLE, R_CPU,
+        ROWS
+    };
+    // The server's own name, short: "c-sjc05-b80a87ec" of "c-sjc05-b80a87ec.discord.media:443" (Ultrahand
+    // draws a value too wide for its row off the screen: the whole name never showed), and how it's going
+    // when it isn't connected
     static std::string server(const char* host, u8 state) {
         if (!host[0]) return txt::DBG_NONE;
         std::string s = host;
+        size_t dot = s.find_first_of(".:");
+        if (dot != std::string::npos) s.resize(dot);
         if (state != 2) s += std::string(" (") + txt::DBG_STATES[state < 4 ? state : 0] + ")";
         return s;
     }
@@ -712,28 +837,53 @@ private:
         if (v != shown_[i]) rows_[i]->setValue(shown_[i] = v, true);
     }
 
-    // (a few times a second: the mic's level, and the rest)
+    // (a few times a second: the mic's level, and the rest; rates over the last second or so)
     void refresh() {
-        refreshed_ns_ = ult::nowNs();
+        u64 now = ult::nowNs();
+        refreshed_ns_ = now;
         ChirpDebug d;
         if (!client::debug(&d)) return;
         std::string m = micLevelText(d);
         if (m != level_text_) level_->setValue(level_text_ = m, true);
         char t[48];
-        set(0, server(d.voice_server, d.voice_state));
-        set(1, ms(d.voice_ping));
-        set(2, server(d.stream_server, d.stream_state));
-        set(3, ms(d.stream_ping));
+        bool sharing = d.stream_state == 2;
+        set(R_RANGE, d.color_range < 0 ? txt::DBG_NA : d.color_range ? txt::DBG_FULL : txt::DBG_LIMITED);
+        set(R_REC_FPS, d.record_fps ? std::to_string(d.record_fps) : std::string(txt::DBG_NA));
+        // (frames and bytes sent: per second from two readings a second or more apart)
+        if (!sharing) {
+            rate_ns_ = 0;
+            set(R_FPS, "-"), set(R_BITRATE, "-");
+        } else if (!rate_ns_ || d.stream_frames < rate_frames_) {
+            rate_ns_ = now, rate_frames_ = d.stream_frames, rate_kb_ = d.stream_kb;
+        } else if (now - rate_ns_ >= 1'000'000'000ULL) {
+            double secs = (double)(now - rate_ns_) / 1e9;
+            snprintf(t, sizeof(t), "%.0f fps", (d.stream_frames - rate_frames_) / secs);
+            set(R_FPS, t);
+            snprintf(t, sizeof(t), "%.1f Mbps", (d.stream_kb - rate_kb_) * 8.0 * 1024 / 1e6 / secs);
+            set(R_BITRATE, t);
+            rate_ns_ = now, rate_frames_ = d.stream_frames, rate_kb_ = d.stream_kb;
+        }
+        set(R_LATE, sharing ? std::to_string(d.stream_late) : std::string("-"));
+        set(R_LOST, sharing ? std::to_string(d.stream_lost) : std::string("-"));
+        set(R_BIGGEST, sharing && d.stream_frame_max_kb ? kb(d.stream_frame_max_kb) : std::string("-"));
+        set(R_PING_GW, ms(d.gateway_ping));
+        set(R_PING_VOICE, ms(d.voice_ping));
+        set(R_PING_STREAM, ms(d.stream_ping));
+        set(R_HOST_VOICE, server(d.voice_server, d.voice_state));
+        set(R_HOST_STREAM, server(d.stream_server, d.stream_state));
         snprintf(t, sizeof(t), txt::DBG_OF, (int)d.speakers, (int)d.speakers_max);
-        set(5, t);
+        set(R_SPEAKERS, t);
         snprintf(t, sizeof(t), txt::DBG_OF, (int)d.decoders, (int)d.decoders_max);
-        set(6, t);
+        set(R_DECODERS, t);
         snprintf(t, sizeof(t), "%+d dB", (int)d.mic_gain);
-        set(7, t);
-        set(8, kb(d.system_free_kb));
-        set(9, kb(d.chirp_kb));
+        set(R_GAIN, t);
+        set(R_FREE, kb(d.system_free_kb));
+        set(R_CHIRP, kb(d.chirp_kb));
         snprintf(t, sizeof(t), "%u / %u KB", d.heap_used_kb, d.heap_kb);
-        set(10, t);
+        set(R_HEAP, t);
+        set(R_IDLE, std::to_string(d.core3_idle) + "%");
+        snprintf(t, sizeof(t), "%u.%u%%", d.chirp_cpu / 10, d.chirp_cpu % 10);
+        set(R_CPU, t);
     }
 
     tsl::elm::ListItem* level_ = nullptr;
@@ -741,28 +891,30 @@ private:
     tsl::elm::ListItem* rows_[ROWS] = {};
     std::string shown_[ROWS];
     u64 refreshed_ns_ = 0;
+    u64 rate_ns_ = 0;
+    u32 rate_frames_ = 0, rate_kb_ = 0;
 };
 
 class UserGui;
 
-// Controls (Leave, Deafen, Mute), then the members, us first; picking
+// Controls (Disconnect, Deafen, Mute), then the members, us first; picking
 // someone else gives our mute and volume for them
 class CallGui : public tsl::Gui {
 public:
     tsl::elm::Element* createUI() override {
         poll(true);
         serial_ = g_now.st.serial;
-        // (the channel, and under it how long the bot's been in it, ticking)
-        frame_ = new tsl::elm::OverlayFrame(fmt(txt::CALL_TITLE, g_now.st.call_channel_name), txt::CALL_KEYS);
+        // (the channel, and under it how long the bot's been in it, ticking: update() sets it)
+        frame_ = new tsl::elm::OverlayFrame(fmt(txt::CALL_TITLE, g_now.st.call_channel_name), connectedFor());
         auto* list = new tsl::elm::List();
         // (keys 1..3 for these, members' ids for them: the cursor stays where it
-        // was when the page is made again; it starts on Mute, not on Leave)
+        // was when the page is made again; it starts on Mute, not on Disconnect)
         list->addItem(new tsl::elm::CategoryHeader(txt::CONTROLS));
-        // (Mute, Deafen, Screenshare, Volume, Settings, Leave; X and Y mute and deafen from anywhere on the page)
-        mute_ = new PickToggle(txt::MUTE, g_now.st.self_mute != 0, 3, &g_pick_call);
+        // (Mute, Deafen, Screenshare, Volume, Settings, Disconnect; X and Y mute and deafen from anywhere on the page)
+        mute_ = new PickToggle(txt::MUTE_X, g_now.st.self_mute != 0, 3, &g_pick_call);
         mute_->setStateChangedListener([](bool on) { client::setSelfMute(on); });
         list->addItem(mute_);
-        deaf_ = new PickToggle(txt::DEAFEN, g_now.st.self_deaf != 0, 2, &g_pick_call);
+        deaf_ = new PickToggle(txt::DEAFEN_Y, g_now.st.self_deaf != 0, 2, &g_pick_call);
         deaf_->setStateChangedListener([](bool on) { client::setSelfDeaf(on); });
         list->addItem(deaf_);
         // (a Go Live stream of the game, picture and sound)
@@ -785,10 +937,10 @@ public:
         });
         list->addItem(leave);
         auto people = client::members(g_now.st.call_channel);
-        meFirst(people);
+        byName(people);
         seen_ns_ = g_now.polled_ns;
         rows_.clear();
-        list->addItem(new tsl::elm::CategoryHeader(fmt(txt::MEMBERS, (unsigned)people.size())));
+        list->addItem(new tsl::elm::CategoryHeader(fmt(txt::ACTIVE_MEMBERS, (unsigned)people.size())));
         for (const ChirpMember& m : people) {
             // (someone else: their page, with our mute and volume for them)
             std::function<void()> open;
@@ -812,6 +964,8 @@ public:
             tsl::swapTo<CallGui>();
             return;
         }
+        std::string sub = connectedFor();  // (every frame: the clock ticks smoothly)
+        if (sub != frame_->m_subtitle) frame_->m_subtitle = sub;
         // (Discord has the last word on mute and deafen: the toggles follow it)
         if (mute_->getState() != (g_now.st.self_mute != 0)) mute_->setState(g_now.st.self_mute != 0);
         if (deaf_->getState() != (g_now.st.self_deaf != 0)) deaf_->setState(g_now.st.self_deaf != 0);
@@ -934,14 +1088,11 @@ public:
     tsl::elm::Element* createUI() override {
         auto* frame = new tsl::elm::OverlayFrame(txt::SELECT_LOGIN, txt::LOGINS_HINT);
         auto* list = new tsl::elm::List();
-        // how the bot shows: invisible (offline to everyone, still connected), and Rich Presence
+        // how the bot shows: invisible (offline to everyone, still connected). (Rich Presence: on Home)
         list->addItem(new tsl::elm::CategoryHeader(txt::STATUS));
         auto* invisible = new tsl::elm::ToggleListItem(txt::INVISIBLE, g_now.st.invisible != 0);
         invisible->setStateChangedListener([](bool on) { client::setInvisible(on); });
         list->addItem(invisible);
-        auto* rpc = new tsl::elm::ToggleListItem(txt::RICH_PRESENCE, g_now.st.rich_presence != 0);
-        rpc->setStateChangedListener([](bool on) { client::setRichPresence(on); });
-        list->addItem(rpc);
         list->addItem(new tsl::elm::CategoryHeader(txt::LOGINS));
         auto logins = client::logins();
         for (const ChirpLogin& l : logins) {
@@ -969,8 +1120,7 @@ public:
     }
 };
 
-bool AccountRow::onClick(u64 keys) {
-    if (!(keys & HidNpadButton_A) || !g_now.running) return false;
+bool BotRow::onA() {
     tsl::changeTo<LoginGui>();
     return true;
 }

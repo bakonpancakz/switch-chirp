@@ -9,30 +9,36 @@ and can share the game, picture and sound, as a Go Live stream.
 
 ## What it does
 
-- **Home:** the bot's picture and name, and under them whether it's
-  connected (or how long until it tries again: 3 s at most). A on it opens
-  **Select Login**: **Appear Invisible** (on by default: the bot shows offline
-  to everyone while Chirp stays connected, so it isn't online whenever the
-  Switch is on), **Rich Presence** ("Playing <game>" and for how long, real
-  games only; not shown while invisible), and the bots in `token.ini`. Then your servers, each
-  with its icon and how many are in voice.
-- **Voice channels:** in Discord's order, under their categories, each with
-  how many are in it. A channel: Join Channel, Join Channel Muted, and who's in it.
-- **In a call:** "Chirp: <channel>", then **Mute**, **Deafen**, **Screenshare**,
+- **Home:** **Profile**, then your servers. Profile is three rows:
+  - Whether the bot is connected, or how long until it tries again (3 s at most). A on it retries now.
+  - The bot's picture and name. A on it opens **Select Login**: **Appear Invisible** (on by default: the bot
+    shows offline to everyone while Chirp stays connected, so it isn't online whenever the Switch is on) and the
+    bots in `token.ini`.
+  - **Rich Presence**: "Playing <game>" and for how long, real games only, not shown while invisible. A turns it
+    on and off.
+
+  The servers come sorted by name, each with its icon and how many are active in voice.
+- **Voice channels:** under their categories, sorted by name, each with how many are active in it. A channel:
+  **Join Channel** (muted if the bot was muted last time) and who's in it, by name.
+- **In a call:** "Chirp: <channel>" and how long it's been connected, then **Mute**, **Deafen**, **Screenshare**,
   **Volume** (everyone, 0–200% in steps of 5%), **Settings** (a page of its
-  own) and **Leave Channel**. X mutes and Y deafens from anywhere on that page. Then the
-  members, the bot first, each with their picture (a green ring while they
+  own) and **Disconnect**. X mutes and Y deafens from anywhere on that page. Then the
+  members by name, each with their picture (a green ring while they
   talk) and their mute and deafen state.
 - **Someone in the call:** Mute and Volume (0–200%), which only change what
   you hear, saved in `config/sys-chirp/people.ini`.
 - **Settings:** the mic's **Input Volume** (0–200%), **Input Sensitivity**
   (Automatic, or -80 to -15 dB, with the mic's level shown live beside the
   line to pick it by), **Automatic Gain Control**, **Noise Suppression** and
-  **HOME Button Light** (Off, or the light's 15 levels, 7–100%: the HOME button's ring on
+  **HOME Input Indicator** (Off, or the light's 15 levels, 7–100%: the HOME button's ring on
   every connected Pro Controller and right Joy-Con lights up while what you
-  say is being sent; not on a Switch Lite), kept in `settings.ini`; then **Debug: Connection** (the voice servers, their pings,
-  the call's elapsed time), **Debug: Sound** (people followed, decoders in
-  use, the mic's gain) and **Debug: Memory**.
+  say is being sent; not on a Switch Lite), kept in `settings.ini`. Then the Debug sections:
+  - **Debug: Screenshare:** the colour range the recorder labels its video with, the frame rate it records at
+    (30, or 60 with `continuous_recording_fps`), and frames sent a second, bitrate, late frames, packets viewers
+    lost and the biggest frame.
+  - **Debug: Network:** the gateway's, the call's and the stream's pings, and the voice and stream servers.
+  - **Debug: Audio:** people followed, decoders in use, the mic's gain.
+  - **Debug: System:** memory, and how idle core 3 is next to Chirp's own share of it.
 - **Hearing:** each person's Opus packets go through a small jitter buffer
   (20 ms cushion) to the Switch's hardware Opus decoders (eight people
   followed, four heard at once), mixed and played through audout (100 ms
@@ -44,7 +50,9 @@ and can share the game, picture and sound, as a Go Live stream.
   gain (if on) and Chirp's own Opus encoder (64 kbps). It only sends while
   you talk.
 - **Screenshare:** a Go Live stream of what the Switch records (grc:d, the
-  service SysDVR uses): 1280x720 H.264 at 30 frames a second, and the game's
+  service SysDVR uses): 1280x720 H.264 at the Switch's recording rate (30 frames a second, 60 with
+  `continuous_recording_fps=u32!60` under `[am.debug]` in `system_settings.ini`), labelled with the colour range the
+  recorder gives it, and the game's
   sound (mono Opus, 96 kbps), on its own connection. When there's no picture
   (no game, the HOME menu), viewers see a loading screen (below), or grey.
 - **Encryption:** Discord's end-to-end encryption (DAVE, on MLS) for sound
@@ -55,7 +63,9 @@ username.
 
 ## What you need
 
-- Atmosphère, and [Ultrahand Overlay](https://github.com/ppkantorski/Ultrahand-Overlay)
+- Firmware 23.0.0 or newer with **Atmosphère 1.12.2** or newer (23.5.0 needs 1.12.2), and
+  [Ultrahand Overlay](https://github.com/ppkantorski/Ultrahand-Overlay). Older firmware gives sysmodules too
+  little memory for Chirp (see [How it's made](#how-its-made)).
 - The Switch on Wi-Fi
 - A Discord bot (below). It's free and takes a few minutes.
 
@@ -106,7 +116,7 @@ more.
 - **No bot token:** `token.txt` isn't there, or it's empty, or it holds
   something that can't be a token.
 - **Discord turned the token down:** Discord closed the session with 4004.
-  Copy the token again (Reset Token makes a new one), then **Connect Again**.
+  Copy the token again (Reset Token makes a new one), then press A on the status row (**Retry**).
 - **Offline:** no network, or the connection broke. Chirp starts a new session by
   itself, waiting 1, 2, then 3 seconds between tries.
 
@@ -133,11 +143,15 @@ Chirp plays short sounds for what happens in the call. They're WAVs in
 | `voice_leave.wav` | you leave it, or someone goes out of it |
 | `screenshare_join.wav` | someone starts watching your screen share |
 | `screenshare_leave.wav` | someone stops watching it |
+| `stream_start.wav` / `stream_stop.wav` | your screen share goes live, or ends (while you're still in the call) |
+| `mute.wav` / `unmute.wav` | you're muted or unmuted (once Discord has it, in a call) |
+| `deafen.wav` / `undeafen.wav` | you're deafened or undeafened (unmuting while deafened undeafens) |
 
 The log also says how many are watching.
 
 Swap any of them for your own: 16-bit PCM WAV, mono or stereo, 8 to 48 kHz.
-They're mixed to mono and played at your volume, not while you're deafened.
+They're mixed to mono and played at a third of your volume (under people's voices). The call's ones aren't played while you're deafened;
+your own mute and deafen ones are, so you hear yourself deafen.
 Each is read from the card when it plays, into one 48 KB buffer: up to 1 s at
 24 kHz, 0.5 s at 48 kHz. Anything longer is cut with a short fade. Delete one
 to silence it. The ones that come with Chirp are in the spirit of the old
@@ -153,7 +167,8 @@ Everything the sysmodule keeps is in fixed tables and buffers. Nothing is
 allocated as it runs, so its memory is known at build time
 (`aarch64-none-elf-size chirp.elf`), about 6.2 MB in all. That needs more room than stock
 Atmosphère gives sysmodules on firmware 20 to 22 (7 MB extra on 21+, shared by all of them; on
-22.5.0, 1 MB was left in a game before v0.2). Firmware 23.0.0+ with Atmosphère 1.12.1 gives 40 MB.
+22.5.0, 1 MB was left in a game before v0.2). Firmware 23.0.0+ with Atmosphère 1.12.1+ gives 40 MB
+(on 23.5.0 with 1.12.2, about 26 MB was left with Chirp and a handful of other sysmodules running).
 On 22.x, raise `ExtraSystemMemoryForAtmosphere_21_0_0` in mesosphere's
 `kern_k_system_control.cpp` (14 MB works; the browser applets get that much less):
 

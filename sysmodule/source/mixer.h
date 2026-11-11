@@ -92,10 +92,11 @@ struct Jitter {
     const Slot* pop(Stats* st);
 };
 
-// A sound effect (sounds.h: joining, leaving): mono s16 at rate Hz (8000..48000), played once over
-// whatever else plays, at the master volume, silent while deafened. pcm must stay as it is until it's
-// done (soundPlaying() false) or stopSound() returns. audout stays open until it's played
-void playSound(const int16_t* pcm, size_t n, int rate);
+// A sound effect (sounds.h: joining, leaving, muting): mono s16 at rate Hz (8000..48000), played once
+// over whatever else plays, at the master volume; silent while deafened, unless through_deaf (our own
+// mute and deafen). pcm must stay as it is until it's done (soundPlaying() false) or stopSound()
+// returns. audout stays open until it's played
+void playSound(const int16_t* pcm, size_t n, int rate, bool through_deaf = false);
 void stopSound();
 bool soundPlaying();
 // (apart for the PC tests) The next 20 ms of it at 48 kHz into out (MIXER_FRAME samples), from *pos

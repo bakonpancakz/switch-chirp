@@ -16,7 +16,7 @@
 #define CHIRP_PEOPLE_INI CHIRP_DIR "/people.ini"  // our mute and volume for people (store.h)
 #define CHIRP_LOADING CHIRP_DIR "/loading"  // *.h264: keyframes shown while sharing and the game shows nothing (scripts/loading.ps1)
 #define CHIRP_AVATARS CHIRP_DIR "/avatars"
-#define CHIRP_SOUNDS CHIRP_DIR "/sounds"  // voice_join.wav, voice_leave.wav, screenshare_join.wav, screenshare_leave.wav (sounds.h)  // {ChirpMember.avatar}.png, fetched by the sysmodule
+#define CHIRP_SOUNDS CHIRP_DIR "/sounds"  // voice_join.wav, voice_leave.wav, screenshare_join.wav, screenshare_leave.wav, stream_start.wav, stream_stop.wav, mute.wav, unmute.wav, deafen.wav, undeafen.wav (sounds.h)  // {ChirpMember.avatar}.png, fetched by the sysmodule
 
 // A name as it's kept and shown: UTF-8, cut (with "…") to fit, NUL-terminated
 #define CHIRP_NAME 48
@@ -45,13 +45,13 @@ enum ChirpCmd {
     ChirpCmd_SetLogin = 17,       // in ChirpLogin: connect as that bot from now on
     ChirpCmd_SetMic = 18,         // in ChirpMic: input volume, sensitivity, automatic gain, noise suppression, HOME light (kept in settings.ini)
     ChirpCmd_GetDebug = 19,       // out buffer ChirpDebug
-    ChirpCmd_SetFullRange = 20,   // in u32 0/1: label the screen's video full range (kept in settings.ini)
+    ChirpCmd_SetFullRange = 20,   // in u32 0/1: label the screen's video full range, whatever grc says (kept in settings.ini)
     ChirpCmd_SetInvisible = 21,   // in u32 0/1: the bot appears offline while connected (kept in settings.ini)
 };
 
 // Raised when the commands change. The overlay says so when the sysmodule
 // running is older (it's only loaded again when the Switch restarts).
-#define CHIRP_PROTOCOL 11
+#define CHIRP_PROTOCOL 12
 
 enum ChirpConn {
     ChirpConn_NoToken = 0,     // no token.txt (or it's empty)
@@ -140,6 +140,17 @@ typedef struct ChirpDebug {
     uint32_t system_free_kb;  // the memory every sysmodule shares, left
     uint32_t chirp_kb;        // Chirp's own
     uint32_t heap_used_kb, heap_kb;
+    // (protocol 12)
+    uint16_t gateway_ping;   // ms, Discord's gateway: its heartbeat there and back (0: none yet)
+    uint8_t core3_idle;      // percent of the last second core 3 (the system's, and Chirp's) sat idle
+    uint8_t record_fps;      // the frame rate the Switch records at, as its frames' timestamps say (0: none yet)
+    uint16_t chirp_cpu;      // Chirp's own share of core 3 over that second, per mille
+    uint16_t stream_frame_max_kb;  // the biggest video frame since the stream began
+    // the stream since it began (the overlay takes rates from two readings): frames and bytes of video
+    // sent, frames sent over 25 ms after the one before, packets viewers reported lost
+    uint32_t stream_frames, stream_kb, stream_late, stream_lost;
+    int8_t color_range;      // the range the video goes out labelled with: 0 limited, 1 full, -1 not sharing
+    uint8_t pad3[3];
 } ChirpDebug;
 
 typedef struct ChirpLogin {

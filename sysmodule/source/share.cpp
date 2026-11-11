@@ -45,7 +45,7 @@ bool Video::step(uint64_t now_ms, uint64_t now_tick) {
     }
     last_frame_ms_ = now_ms;
     bool idr = false;
-    params_.full_range = frames_->fullRange() ? 1 : 0;
+    params_.full_range = frames_->fullRange() ? 1 : -1;  // (full when asked for, else as grc labels it)
     n = rtpH264WithParams(f, n, cap - 1024, &params_, &idr);
 
     // The recorder's blank picture (out of the game): the same keyframe again and again, back to back,
@@ -112,7 +112,7 @@ void Video::placeholder(uint64_t now_ms, uint64_t now_tick, bool flush) {
     }
     bool sent = sendLoading(now_tick, flush);
     if (!sent) {
-        grey_params_.full_range = frames_->fullRange() ? 1 : 0;
+        grey_params_.full_range = colorRange();  // (labelled as the game's video is)
         size_t g = h264Placeholder(&grey_params_, grey_id_++, g_grey, H264_PLACEHOLDER_MAX);
         sent = g && sink_->send(g_grey, g, sizeof(g_grey), now_tick);
     }

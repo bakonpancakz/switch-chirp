@@ -4,7 +4,10 @@
 # then a small, quiet room and a low-pass, so nothing is sharp. Rising for a join, falling for a leave.
 # (glow isn't used by the defaults now; it's there to add a note back.)
 # voice_*: two watery bubbles (people joining the call, you too); screenshare_*: three, deeper and
-# slower (people starting to watch your screen share, and stopping).
+# slower (people starting to watch your screen share, and stopping). mute/unmute: one small bubble,
+# falling and rising; deafen/undeafen: one deep, slower one, muffled (as your ears are). stream_*:
+# your own screen share going live and ending: two bright bubbles a fifth apart, quicker and higher than
+# screenshare_* (the viewers'), so "you're live" doesn't sound like "someone's watching".
 # 24 kHz mono 16-bit, as the sysmodule plays them (sounds.h).
 #   python scripts/chimes.py          the bubbly ones
 #   python scripts/chimes.py bells    the plain bell chimes from before
@@ -84,7 +87,7 @@ def room(buf, mix=0.15):
     return [d + mix * w for d, w in zip(buf, wet)]
 
 
-def soften(buf, hz=2500):
+def soften(buf, hz=2500.0):
     """Two one-pole low-passes: takes any edge off."""
     a = 1 - math.exp(-2 * math.pi * hz / RATE)
     for _ in range(2):
@@ -98,10 +101,10 @@ def soften(buf, hz=2500):
 
 
 def bubbly():
-    def make(name, total, peak, parts):
+    def make(name, total, peak, parts, hz=2500.0):
         buf = [0.0] * int(total * RATE)
         parts(buf)
-        write(name, soften(room(buf)), peak)
+        write(name, soften(room(buf), hz), peak)
 
     # Water, not a chime: each bubble swoops fast and far (a drop's "bloop"), trembles a touch and has
     # a whisper of wood; no held note at the end.
@@ -125,6 +128,34 @@ def bubbly():
         blub(b, 0.00, 960, 0.9, lift=0.68, decay=32, **wet)
         blub(b, 0.07, 720, 0.8, lift=0.68, decay=26, **wet)
 
+    # your own: one bubble each, so they don't sound like someone coming or going
+    def mute(b):
+        blub(b, 0.00, 820, 0.9, lift=0.62, decay=34, **wet)
+
+    def unmute(b):
+        blub(b, 0.00, 560, 0.9, lift=1.6, decay=34, **wet)
+
+    def deafen(b):  # (it swoops at once, so it's heard at the note it ends on: ~440 Hz, as undeafen's. Ending
+        # at ~250 it heard ~3.5 dB quieter than the rest: ears and earbuds give little that low)
+        blub(b, 0.00, 720, 0.95, lift=0.61, decay=20, **wet)
+
+    def undeafen(b):
+        blub(b, 0.00, 260, 0.95, lift=1.7, decay=20, **wet)
+
+    def stream_start(b):
+        blub(b, 0.00, 520, 0.85, lift=1.5, decay=30, **wet)
+        blub(b, 0.06, 780, 0.95, lift=1.5, decay=18, **wet)
+
+    def stream_stop(b):
+        blub(b, 0.00, 1170, 0.95, lift=0.67, decay=30, **wet)
+        blub(b, 0.06, 780, 0.85, lift=0.67, decay=18, **wet)
+
+    make("stream_start", 0.5, 0.33, stream_start)  # (quieter peaks: higher notes are heard louder)
+    make("stream_stop", 0.5, 0.33, stream_stop)
+    make("mute", 0.35, 0.42, mute)
+    make("unmute", 0.35, 0.42, unmute)
+    make("deafen", 0.45, 0.45, deafen, hz=1400.0)
+    make("undeafen", 0.45, 0.45, undeafen, hz=1400.0)
     make("voice_join", 0.5, 0.45, voice_join)
     make("voice_leave", 0.5, 0.45, voice_leave)
     make("screenshare_join", 0.75, 0.45, share_join)

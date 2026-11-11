@@ -23,8 +23,9 @@ bool start();  // (false: its threads couldn't be made)
 void stop();
 
 void setWanted(bool on);  // the overlay's toggle
-// The video's colour range as labelled for viewers: grc labels it limited (16..235); full (0..255) if its
-// pictures really are (blacks crushed and whites clipped otherwise). Takes effect at the next keyframe
+// The video labelled full range (0..255) for viewers, whatever grc's SPS says (limited, 16..235, even
+// with a full-range patch: those set the flag in grc's avcC, the saved clips', not the SPS it streams).
+// Off: as grc labels it. Takes effect at the next keyframe
 void setFullRange(bool on);
 bool fullRange();
 bool wanted();
@@ -42,6 +43,9 @@ bool take(uint8_t** frame, size_t* n, size_t* cap, uint64_t* tick, bool* gap);
 void done();
 // Until a frame or a sound packet is ready to take (at once if one is), or timeout_ns: false, the time ran out
 bool waitWork(uint64_t timeout_ns);
+// The frame rate the Switch records at, from its frames' timestamps (30, or 60 with
+// continuous_recording_fps set; 0: no frames yet)
+unsigned recordFps();
 
 // The game's sound as grc:d records it (48 kHz stereo), mixed to mono and encoded (opusenc.h): the
 // next packet, in order; false: none waiting

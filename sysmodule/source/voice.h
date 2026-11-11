@@ -35,5 +35,9 @@ State streamState();
 
 // For the overlay's Debug: each connection's voice server (host:port; empty: none) and heartbeat round trip (ms; 0: none yet)
 void info(char voice_server[64], uint16_t* voice_ping, char stream_server[64], uint16_t* stream_ping);
+// And the stream's since it began (zeros when there's none): video frames and KB sent, frames sent over
+// 25 ms after the one before, packets viewers reported lost, the biggest frame
+// (range: the colour range the recorder labels its video with: 0 limited, 1 full, -1 not seen yet)
+void streamTotals(uint32_t* frames, uint32_t* kb, uint32_t* late, uint32_t* lost, uint32_t* frame_max_kb, int* range);
 
 }  // namespace voice

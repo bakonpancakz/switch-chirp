@@ -149,6 +149,7 @@ void Gateway::heartbeat() {
     if (seq_ < 0) snprintf(msg, sizeof(msg), "{\"op\":1,\"d\":null}");
     else snprintf(msg, sizeof(msg), "{\"op\":1,\"d\":%lld}", (long long)seq_);
     acked_ = false;
+    beat_sent_ms_ = now_ms_;
     send(msg);
 }
 
@@ -231,6 +232,8 @@ void Gateway::messageEnd() {
         case 11:  // Heartbeat ACK
             if (!acked_ && !first_ack_) say("heartbeats are getting through");
             if (!acked_) first_ack_ = true;
+            if (!acked_ && beat_sent_ms_ && now_ms_ >= beat_sent_ms_)
+                ping_ms_ = (uint16_t)(now_ms_ - beat_sent_ms_ < 65535 ? now_ms_ - beat_sent_ms_ : 65535);
             acked_ = true;
             break;
         case 1:  // Discord wants a heartbeat now

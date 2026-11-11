@@ -26,5 +26,6 @@ people.ini
 test/out/
 test/interop/out/
 test/interop/node_modules/
+test/interop/fromlog.json
 test/opus-ref/
 test/rnnoise-ref/

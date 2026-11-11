@@ -50,6 +50,14 @@ s64 wallClock() {
     return (s64)t;
 }
 
+// The real time now (Unix seconds), for what Discord compares with its own clock: the network clock (set
+// from Nintendo's servers), else the user's (what System Settings says, which may be off: 0 if neither)
+s64 realClock() {
+    u64 t = 0;
+    if (R_SUCCEEDED(timeGetCurrentTime(TimeType_NetworkSystemClock, &t)) && t) return (s64)t;
+    return wallClock();
+}
+
 u64 nowMs() { return armTicksToNs(armGetSystemTick()) / 1000000ULL; }
 
 void random(void* out, size_t n) { randomGet(out, n); }
@@ -95,6 +103,10 @@ u8 g_conn = ChirpConn_NoToken;
 u16 g_last_close = 0;
 u64 g_retry_at_ms = 0;
 bool g_want_mute = false, g_want_deaf = false;  // ours, kept when not in a call
+bool g_full_range = false;  // (the screen's video labelled full range, whatever grc's SPS says)
+// (core 3 over the last second: how much sat idle, percent; Chirp's own share, per mille. For Debug)
+volatile uint8_t g_core3_idle = 0;
+volatile uint16_t g_chirp_cpu = 0;
 // The call to go back to when a session that was in one drops (the network, Discord asking for a
 // reconnect): the new session asks for it again once READY. Not after Reload (another login, maybe),
 // nor when it's been too long. (The old session's voice state isn't ours to use: gateway.h)
@@ -125,7 +137,6 @@ char g_login_active[CHIRP_NAME] = "";  // the one connected as (empty: token.txt
 int g_mic_volume = 100, g_mic_sensitivity = MIC_SENSITIVITY_AUTO;
 bool g_mic_agc = true, g_mic_denoise = true;
 int g_home_light = 50;  // the HOME button's light while talking: 0 off, else percent
-bool g_full_range = false;  // (the screen's video labelled full range)
 // the bot's presence (settings.ini): invisible (shows offline, the default: not online whenever the
 // Switch is on), and Rich Presence ("Playing <game>"); dirty: say it again
 bool g_invisible = true, g_rpc = false, g_rpc_dirty = true;
@@ -194,7 +205,7 @@ void saveSettings() {
                      "# the mic: volume in percent (0..200); sensitivity auto, or the level talk must be over (dBFS, e.g. -45)\n"
                      "input_volume=%d\ninput_sensitivity=%s\nautomatic_gain=%s\nnoise_suppression=%s\n"
                      "# the HOME button's light while you talk: 0 off, else its brightness in percent (15 levels: 7, 13, 20 ... 100)\nhome_light=%d\n"
-                     "# Screenshare: label the video full range (0..255) rather than grc's limited (16..235)\nfull_range_video=%s\n"
+                     "# Screenshare: label the video full range (0..255) rather than as grc does (limited, 16..235)\nfull_range_video=%s\n"
                      "# the bot: offline to everyone while connected; \"Playing <game>\"\nappear_invisible=%s\nrich_presence=%s\n",
                      g_login, g_mic_volume, sens, g_mic_agc ? "true" : "false", g_mic_denoise ? "true" : "false", g_home_light,
                      g_full_range ? "true" : "false", g_invisible ? "true" : "false", g_rpc ? "true" : "false");
@@ -293,8 +304,11 @@ bool loadToken(char* out, size_t cap) {
 
 // The bot's presence: every few seconds, what's running (Rich Presence); when that or a setting changes, said
 // again (op 3). The game's name is read once per game (game.h: into the send queue's buffer while it's idle)
+// Each change is said again 20 s later, once: Discord drops presence updates past its rate limit without
+// a word (opening and closing games, or turning it on and off, in quick succession), and one dropped
+// left the bot "playing" a game long closed
 void rpcTick(uint64_t now) {
-    static uint64_t next = 0, shown = ~0ULL, start_ms = 0;
+    static uint64_t next = 0, shown = ~0ULL, start_ms = 0, again_at = 0;
     if (!g_gw.ready()) {
         shown = ~0ULL;
         return;
@@ -305,20 +319,32 @@ void rpcTick(uint64_t now) {
     // (real games only: Nintendo's application ids all start 01, homebrew installed as an application
     // (sphaira, forwarders) takes others: it isn't announced)
     if ((tid >> 56) != 0x01) tid = 0;
-    if (tid == shown && !g_rpc_dirty) return;
+    bool again = tid == shown && !g_rpc_dirty && again_at && now >= again_at;
+    if (tid == shown && !g_rpc_dirty && !again) return;
     if (tid) {
         char name[CHIRP_NAME];
         if (!game::name(tid, name, sizeof(name))) return;  // (no buffer or no data just now: in 5 s again)
-        // (the Switch's clock, as the log's: libc's time() isn't set up in a sysmodule, and gave 1970)
-        if (tid != shown) start_ms = (uint64_t)wallClock() * 1000;
+        // (the network clock: Discord counts from it to its own now, and a start ahead of that shows a
+        // timer stuck at 0:00 until it's caught up; the user's clock can be off. libc's time() isn't set
+        // up in a sysmodule, and gave 1970)
+        if (tid != shown) {
+            start_ms = (uint64_t)realClock() * 1000;
+            char line[128];
+            snprintf(line, sizeof(line), "presence: started %llu (network clock; the user clock is %+lld s from it)",
+                     (unsigned long long)(start_ms / 1000), (long long)(wallClock() - realClock()));
+            log(line);
+        }
         snprintf(g_game, sizeof(g_game), "%s", name);
     } else {
         g_game[0] = 0;
     }
     if (g_gw.presence(g_game, start_ms)) {
-        char line[128];
-        snprintf(line, sizeof(line), "presence: %s%s%s", g_invisible ? "invisible" : "online", g_game[0] ? ", playing " : "", g_game);
-        log(line);
+        if (!again) {
+            char line[128];
+            snprintf(line, sizeof(line), "presence: %s%s%s", g_invisible ? "invisible" : "online", g_game[0] ? ", playing " : "", g_game);
+            log(line);
+        }
+        again_at = again ? 0 : now + 20000;
         shown = tid;
         g_rpc_dirty = false;
     }
@@ -393,6 +419,17 @@ void syncVoice() {
     else if (channel && g_gw.othersLeft() != left_seen) playSound(sounds::VoiceLeave);
     else if (channel && g_gw.viewersJoined() != watch_seen) playSound(sounds::ScreenshareJoin);
     else if (channel && g_gw.viewersLeft() != unwatch_seen) playSound(sounds::ScreenshareLeave);
+    // Our own mute and deafen, whenever they change: in a call, as Discord says they are (heard once it's
+    // done, not when it's asked); out of one, as they're kept for the next. (Joining and leaving play their own sound: what changes with them doesn't
+    // play another. Deafened is muted too: undeafening says Undeafen, not Unmute as well)
+    bool deaf = channel ? g_gw.selfDeaf() : g_want_deaf;
+    bool muted = channel ? g_gw.selfMute() || deaf : g_want_mute || g_want_deaf;
+    static bool was_deaf = false, was_muted = false;
+    if (channel == was_channel) {
+        if (deaf != was_deaf) playSound(deaf ? sounds::Deafen : sounds::Undeafen);
+        else if (muted != was_muted) playSound(muted ? sounds::Mute : sounds::Unmute);
+    }
+    was_deaf = deaf, was_muted = muted;
     joined_seen = g_gw.othersJoined(), left_seen = g_gw.othersLeft();
     watch_seen = g_gw.viewersJoined(), unwatch_seen = g_gw.viewersLeft();
     was_channel = channel;
@@ -414,6 +451,17 @@ void syncVoice() {
                              g_gw.streamToken(), g_gw.streamEndpoint());
     else
         voice::streamDisconnect();
+    // Our screen share's sounds: once it's live (its connection up: viewers can see it), and once it's over
+    // while still in the call (out of it, the leave sound says it). Its connection dropping and coming back
+    // while it goes on plays neither
+    static bool live_heard = false;
+    if (!live_heard && g_stream_channel && voice::streamState() == voice::Voice_Connected) {
+        playSound(sounds::StreamStart);
+        live_heard = true;
+    } else if (live_heard && !g_stream_channel) {
+        if (channel) playSound(sounds::StreamStop);
+        live_heard = false;
+    }
 }
 
 // Each speaker's volume for the mixer (its thread asks, every frame): percent, 0 when muted for us
@@ -498,9 +546,16 @@ bool session(const char* token) {
             // (how busy core 3 is, everyone's on it, every 30 s whatever's going on: with what runs, compared
             // across boots with one sysmodule or another turned off, where its time goes. This thread's on core 3)
             static uint64_t idle_at = 0, idle_ticks = 0, chirp_ticks = 0;
+            static uint64_t sec_at = 0, sec_idle = 0, sec_chirp = 0;
             uint64_t idle = 0, at = armGetSystemTick(), chirp = cpushare::ticks();
-            if (R_SUCCEEDED(svcGetInfo(&idle, InfoType_IdleTickCount, INVALID_HANDLE, (u64)-1)) &&
-                (!idle_at || at - idle_at >= armNsToTicks(30'000'000'000ULL))) {
+            bool have_idle = R_SUCCEEDED(svcGetInfo(&idle, InfoType_IdleTickCount, INVALID_HANDLE, (u64)-1));
+            // (the last second's, for the overlay's Debug)
+            if (have_idle && sec_at && at > sec_at) {
+                g_core3_idle = (uint8_t)((idle - sec_idle) * 100 / (at - sec_at));
+                g_chirp_cpu = (uint16_t)((chirp - sec_chirp) * 1000 / (at - sec_at));
+            }
+            sec_at = at, sec_idle = idle, sec_chirp = chirp;
+            if (have_idle && (!idle_at || at - idle_at >= armNsToTicks(30'000'000'000ULL))) {
                 if (idle_at) {
                     char line[128];
                     uint64_t span = at - idle_at;
@@ -905,6 +960,7 @@ static void syncWanted() {
     }
 }
 
+// (their sounds play once the change is made: syncVoice)
 void setSelfMute(bool on) {
     mutexLock(&g_lock);
     syncWanted();
@@ -998,6 +1054,14 @@ void setMic(int volume, int sensitivity, bool agc, bool denoise, int home_light)
     settingsChanged();
 }
 
+void setFullRange(bool on) {
+    mutexLock(&g_lock);
+    g_full_range = on;
+    screen::setFullRange(on);
+    mutexUnlock(&g_lock);
+    settingsChanged();
+}
+
 void setInvisible(bool on) {
     mutexLock(&g_lock);
     g_invisible = on;
@@ -1011,14 +1075,6 @@ void setRichPresence(bool on) {
     mutexLock(&g_lock);
     g_rpc = on;
     g_rpc_dirty = true;
-    mutexUnlock(&g_lock);
-    settingsChanged();
-}
-
-void setFullRange(bool on) {
-    mutexLock(&g_lock);
-    g_full_range = on;
-    screen::setFullRange(on);
     mutexUnlock(&g_lock);
     settingsChanged();
 }
@@ -1040,7 +1096,19 @@ void debug(ChirpDebug* d) {
     unsigned free_kb = 0, chirp_kb = 0, heap_used = 0, heap = 0;
     limits::memory(&free_kb, &chirp_kb, &heap_used, &heap);
     d->system_free_kb = free_kb, d->chirp_kb = chirp_kb, d->heap_used_kb = heap_used, d->heap_kb = heap;
+    mutexLock(&g_lock);
+    d->gateway_ping = g_session ? g_gw.ping() : 0;
+    mutexUnlock(&g_lock);
+    d->core3_idle = g_core3_idle, d->chirp_cpu = g_chirp_cpu;
+    unsigned fps = screen::recordFps();
+    d->record_fps = (uint8_t)(fps < 255 ? fps : 255);
+    uint32_t frame_max_kb = 0;
+    int range = -1;
+    voice::streamTotals(&d->stream_frames, &d->stream_kb, &d->stream_late, &d->stream_lost, &frame_max_kb, &range);
+    d->color_range = (int8_t)range;
+    d->stream_frame_max_kb = (uint16_t)(frame_max_kb < 65535 ? frame_max_kb : 65535);
 }
+
 
 size_t listLogins(ChirpLogin* out, size_t cap) {
     size_t n = 0;

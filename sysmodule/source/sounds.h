@@ -1,5 +1,6 @@
 // The call's sounds: voice_* as people (us too) join the call and leave it, screenshare_* as they start
-// watching our screen share and stop, as Discord plays them. Each is a
+// watching our screen share and stop, as Discord plays them; stream_start and stream_stop as our own
+// screen share goes live and ends; and mute, unmute, deafen, undeafen as we change our own (heard even while deafened, unlike the others: deafening has to be heard). Each is a
 // WAV on the card (CHIRP_SOUNDS/<name>.wav: 16-bit PCM, mono or stereo, 8..48 kHz), read when it's
 // wanted into the one buffer there is (SOUNDS_MAX samples, mixed to mono: 1 s at 24 kHz, 0.5 s at
 // 48; longer is cut, faded) and played by the mixer (mixer.h), resampled to 48 kHz. A missing file is
@@ -12,7 +13,10 @@
 
 namespace sounds {
 
-enum Kind : uint8_t { VoiceJoin, VoiceLeave, ScreenshareJoin, ScreenshareLeave, KINDS };
+enum Kind : uint8_t { VoiceJoin, VoiceLeave, ScreenshareJoin, ScreenshareLeave, StreamStart, StreamStop,
+                     Mute, Unmute, Deafen, Undeafen, KINDS };
+// Whether it's heard while deafened (our own mute and deafen: the rest are the call's, deafened away)
+inline bool throughDeaf(Kind k) { return k >= Mute && k < KINDS; }
 const char* name(Kind k);  // its file's name, without ".wav"
 
 // Read it and play it (the card's thread; it takes a moment)

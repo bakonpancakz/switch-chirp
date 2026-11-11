@@ -83,8 +83,8 @@ struct ScreenFrames : share::Frames {
     bool take(uint8_t** f, size_t* n, size_t* cap, uint64_t* tick, bool* gap) override { return screen::take(f, n, cap, tick, gap); }
     void done() override { screen::done(); }
     uint8_t* borrow(size_t* cap, bool flush) override { return screen::borrowRing(cap, flush); }
-    void giveBack() override { screen::returnRing(); }
     bool fullRange() override { return screen::fullRange(); }
+    void giveBack() override { screen::returnRing(); }
 } g_frames;
 
 // share::Video's loading screens: *.h264 in CHIRP_LOADING (scripts/loading.ps1 makes them)
@@ -180,6 +180,9 @@ public:
     uint64_t vstart = 0;
     bool video_on = false;  // (announced as active: op 12)
     uint32_t vsent = 0, vbytes = 0;  // (video packets sent, and their bytes)
+    // (since the stream began, for the overlay: frames sent, those over 25 ms after the one before, packets
+    // viewers reported lost, the biggest frame)
+    volatile uint32_t frames_total = 0, late_total = 0, lost_total = 0, frame_max_all = 0;
     // (viewers' RTCP: reports of lost packets and the packets they named; keyframes wanted; bandwidth
     // estimates; RTCP that didn't open. Counted only: Discord passed no lost-packet reports on, so
     // sending packets again (RTX) did nothing, and was taken out)
@@ -702,7 +705,12 @@ bool Session::sendFrame(uint8_t* frame, size_t n, size_t cap, uint64_t tick) {
         uint32_t apart = last_out_ms ? (uint32_t)(t - last_out_ms) : 0;
         last_out_ms = t;
         if (apart > out_apart_max) out_apart_max = apart;
-        if (apart > 25) out_late++;  // (more than a frame and a half after the one before)
+        // (late: more than a frame and a half after the one before, at the rate the Switch records: 25 ms at
+        // 60 fps, 50 at 30)
+        unsigned fps = screen::recordFps();
+        if (apart > (fps ? 1500 / fps : 25)) out_late++, late_total = late_total + 1;
+        frames_total = frames_total + 1;
+        if (n > frame_max_all) frame_max_all = (uint32_t)n;
     }
     return !gave_up;
 }
@@ -725,6 +733,7 @@ void Session::udpPackets(uint64_t now) {
             RtcpFeedback fb = {};
             rtcpFeedback(on ? opened : in, on ? on : (size_t)n, vssrc, nullptr, 0, &fb);
             nacks += fb.nacks, lost += fb.lost, plis += fb.keyframes, rembs += fb.remb;
+            lost_total = lost_total + fb.lost;
             continue;
         }
         if (stream) continue;  // (nothing to hear on a stream)
@@ -802,6 +811,7 @@ uint16_t runSession(Link& L, uint32_t serial) {
     s.last_out_ms = 0, s.out_apart_max = s.out_late = 0;
     s.a_rtp_last = 0, s.a_ns_last = 0, s.next_sr = 0;
     s.a_pkts_total = s.a_octets_total = s.v_pkts_total = s.v_octets_total = 0;
+    s.frames_total = 0, s.late_total = 0, s.lost_total = 0, s.frame_max_all = 0;
     g_rnd(&s.vseq, sizeof(s.vseq));
     g_rnd(&s.vts, sizeof(s.vts));
     s.vstart = armGetSystemTick();
@@ -905,7 +915,7 @@ uint16_t runSession(Link& L, uint32_t serial) {
                 "%u RTCP didn't open", s.lost, s.nacks, s.plis, s.rembs, s.rtcp_unopened);
             say("screen: game sound: %u packets sent (%u not), %u dropped waiting, %u gaps", s.asent, s.aunsent,
                 sc.audio_dropped, sc.audio_holes);
-            say("screen: frames went out up to %u ms apart; %u times over 25 ms after the one before; the slowest took %u ms "
+            say("screen: frames went out up to %u ms apart; %u late (over a frame and a half after the one before); the slowest took %u ms "
                 "to send, the biggest %u KB; the oldest was %u ms old when its sending began", s.out_apart_max, s.out_late,
                 s.send_ms_max, s.frame_max / 1024, s.age_ms_max);
             say("screen: the slowest frame: %u packets; %u us in DAVE's encryption, %u us sealing, %u us waiting for room "
@@ -1098,6 +1108,16 @@ void info(char voice_server[64], uint16_t* voice_ping, char stream_server[64], u
     mutexUnlock(&g_lock);
     *voice_ping = g_voice.state == Voice_Connected ? g_voice.ping : 0;
     *stream_ping = g_stream.state == Voice_Connected ? g_stream.ping : 0;
+}
+
+void streamTotals(uint32_t* frames, uint32_t* kb, uint32_t* late, uint32_t* lost, uint32_t* frame_max_kb, int* range) {
+    bool on = g_stream.state == Voice_Connected;
+    *range = on ? g_ss.video.colorRange() : -1;
+    *frames = on ? g_ss.frames_total : 0;
+    *kb = on ? g_ss.v_octets_total / 1024 : 0;
+    *late = on ? g_ss.late_total : 0;
+    *lost = on ? g_ss.lost_total : 0;
+    *frame_max_kb = on ? g_ss.frame_max_all / 1024 : 0;
 }
 
 }  // namespace voice

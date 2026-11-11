@@ -44,6 +44,8 @@ public:
     // Appear invisible (offline to everyone, still connected): said in Identify, so it never shows online
     // first; changed later with presence()
     void setInvisible(bool on) { invisible_ = on; }
+    // The last heartbeat there and back, ms (0: none answered yet)
+    uint16_t ping() const { return ping_ms_; }
     // The bot's presence (op 3): invisible or online, and Rich Presence's "Playing <game>" (null or empty:
     // nothing) since start_ms (Unix ms; 0: none)
     bool presence(const char* game, uint64_t start_ms);
@@ -169,6 +171,8 @@ private:
     bool invisible_ = true;
     uint32_t interval_ms_ = 0;
     uint64_t next_beat_ms_ = 0, now_ms_ = 0;
+    uint64_t beat_sent_ms_ = 0;  // (when the last heartbeat went: its ACK gives the ping)
+    volatile uint16_t ping_ms_ = 0;
     int64_t seq_ = -1;  // the last "s" (-1: none yet)
     char error_[96];
     uint32_t skipped_ = 0;

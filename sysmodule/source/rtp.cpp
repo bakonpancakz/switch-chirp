@@ -223,7 +223,15 @@ void skipHrd(BitReader& r) {
 
 }  // namespace
 
-size_t h264FixSps(const uint8_t* sps, size_t n, uint8_t* out, size_t cap, int full_range) {
+int h264SpsRange(const uint8_t* sps, size_t n) {
+    uint8_t scratch[300];
+    int range = -1;
+    h264FixSps(sps, n, scratch, sizeof(scratch), -1, &range);
+    return range;
+}
+
+size_t h264FixSps(const uint8_t* sps, size_t n, uint8_t* out, size_t cap, int full_range, int* range_found) {
+    if (range_found) *range_found = -1;
     if (n < 4 || n > 256 || (sps[0] & 0x1f) != 7) return 0;
     uint8_t rbsp[256];
     size_t rn = 0;
@@ -270,7 +278,8 @@ size_t h264FixSps(const uint8_t* sps, size_t n, uint8_t* out, size_t cap, int fu
         if (r.u(1)) {                                   // (video signal type)
             r.u(3);
             range_at = r.pos;
-            r.u(1);
+            uint32_t range = r.u(1);
+            if (range_found && !r.bad) *range_found = (int)range;
             if (r.u(1)) r.u(8), r.u(8), r.u(8);
         }
         if (r.u(1)) r.ue(), r.ue();                     // (chroma location)

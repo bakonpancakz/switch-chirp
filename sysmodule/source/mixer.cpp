@@ -1,4 +1,5 @@
 #include "mixer.h"
+#include "cpushare.h"
 
 #include <math.h>
 #include <string.h>
@@ -532,11 +533,14 @@ void start() {
     resetStats();
     for (Lent& l : g_lent) l.speaker = -1;
     g_run = true;
-    if (R_FAILED(threadCreate(&g_thread, mixThread, nullptr, nullptr, 0x4000, 0x1C, -2))) {
+    // (30: just below the system's sockets (bsd's network threads: 25 to 28, its socket calls 29), so they
+    // never wait their turn behind it)
+    if (R_FAILED(threadCreate(&g_thread, mixThread, nullptr, nullptr, 0x4000, 0x1E, -2))) {
         g_run = false;
         return;
     }
     threadStart(&g_thread);
+    cpushare::track(g_thread.handle);
 }
 
 void stop() {

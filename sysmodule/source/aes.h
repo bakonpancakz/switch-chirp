@@ -73,5 +73,6 @@ struct GcmStream {
 
 private:
     void hash(const uint8_t* p, size_t n);
+    void keystream(uint8_t* p, size_t n);
     void flushPart();
 };

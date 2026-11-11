@@ -1,4 +1,5 @@
 #include "mic.h"
+#include "cpushare.h"
 
 #include <math.h>
 #include <string.h>
@@ -348,6 +349,7 @@ void start() {
         return;
     }
     threadStart(&g_thread);
+    cpushare::track(g_thread.handle);
 }
 
 void stop() {

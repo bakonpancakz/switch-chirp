@@ -1,4 +1,5 @@
 #include "avatars.h"
+#include "cpushare.h"
 
 #include <sys/stat.h>
 #include <switch.h>
@@ -219,6 +220,7 @@ void start() {
         return;
     }
     threadStart(&g_thread);
+    cpushare::track(g_thread.handle);
 }
 
 void stop() {

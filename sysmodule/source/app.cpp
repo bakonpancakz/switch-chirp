@@ -1,4 +1,5 @@
 #include "app.h"
+#include "cpushare.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -494,6 +495,22 @@ bool session(const char* token) {
         if (nowMs() >= next_limits) {
             limits::watch(logFn);
             next_limits = nowMs() + 1000;
+            // (how busy core 3 is, everyone's on it, every 30 s whatever's going on: with what runs, compared
+            // across boots with one sysmodule or another turned off, where its time goes. This thread's on core 3)
+            static uint64_t idle_at = 0, idle_ticks = 0, chirp_ticks = 0;
+            uint64_t idle = 0, at = armGetSystemTick(), chirp = cpushare::ticks();
+            if (R_SUCCEEDED(svcGetInfo(&idle, InfoType_IdleTickCount, INVALID_HANDLE, (u64)-1)) &&
+                (!idle_at || at - idle_at >= armNsToTicks(30'000'000'000ULL))) {
+                if (idle_at) {
+                    char line[128];
+                    uint64_t span = at - idle_at;
+                    snprintf(line, sizeof(line), "core 3: idle %u%%, Chirp %u.%u%% (%s)", (unsigned)((idle - idle_ticks) * 100 / span),
+                             (unsigned)((chirp - chirp_ticks) * 100 / span), (unsigned)((chirp - chirp_ticks) * 1000 / span % 10),
+                             game::running() ? "a title running" : "the HOME menu alone");
+                    log(line);
+                }
+                idle_at = at, idle_ticks = idle, chirp_ticks = chirp;
+            }
             // (the application running, in front or behind the HOME menu, homebrew too (Rich Presence names
             // real games only), logged when it changes; with whether it lets the system record video, read
             // with its name, which needs the screen's queue empty: tried each second until it's known)
@@ -739,7 +756,10 @@ void start() {
     g_run = true;
     // (low: the card can wait; 0x2000 of stack is room for fprintf)
     g_card_thread_on = R_SUCCEEDED(threadCreate(&g_card_thread, cardThread, nullptr, nullptr, 0x2000, 0x2E, -2));
-    if (g_card_thread_on) threadStart(&g_card_thread);
+    if (g_card_thread_on) {
+        threadStart(&g_card_thread);
+        cpushare::track(g_card_thread.handle);
+    }
     log("Chirp started");
     const char* crypto = nullptr;
     aesSelfTest(&crypto);
@@ -752,6 +772,7 @@ void start() {
         return;
     }
     threadStart(&g_thread);
+    cpushare::track(g_thread.handle);
 }
 
 void stop() {

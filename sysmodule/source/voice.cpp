@@ -1,4 +1,5 @@
 #include "voice.h"
+#include "cpushare.h"
 #include "limits.h"
 
 #include <arpa/inet.h>
@@ -170,7 +171,7 @@ public:
     uint64_t next_beat = 0, next_keepalive = 0, next_stats = 0, next_limits = 0;
     int64_t seq = -1;
     uint64_t beat_sent = 0;  // (when the last heartbeat went: its ack gives the ping)
-    uint64_t cpu_ticks = 0, cpu_at = 0;  // (this thread's CPU time, and when it was last read: the stats)
+    uint64_t cpu_ticks = 0, idle_ticks = 0, cpu_at = 0;  // (this thread's CPU time, core 3's idle, and when they were read: the stats)
     int udp = -1;
     uint32_t ssrc = 0;
     uint32_t vssrc = 0, vrtx = 0;  // (Ready's video stream)
@@ -619,8 +620,13 @@ bool Session::sendFrame(uint8_t* frame, size_t n, size_t cap, uint64_t tick) {
     // keyframe took 70 ms though the socket never once was full. Sealed into a batch of BATCH, sent with
     // one sendmmsg(): one call for them all)
     constexpr unsigned BATCH = 16;
-    constexpr size_t PKT = 1100 + RTP_OVERHEAD;
-    static uint8_t scratch[1100], pkts[BATCH][PKT];
+    // (each packet as full as Discord takes: 1200 bytes of UDP payload, WebRTC's usual size, RTP_OVERHEAD
+    // of it ours. Each packet costs the system's sockets the same ~50-100 us of core 3 whatever its size
+    // (sockbench), so fewer, fuller ones: 1100 of video before. Filling a 1500-byte frame (1472) Discord
+    // dropped: viewers saw nothing)
+    constexpr size_t PAYLOAD = 1200 - RTP_OVERHEAD;
+    constexpr size_t PKT = PAYLOAD + RTP_OVERHEAD;
+    static uint8_t scratch[PAYLOAD], pkts[BATCH][PKT];
     static iovec iov[BATCH];
     static mmsghdr msgs[BATCH];
     static bool no_mmsg = false;  // (sendmmsg refused: one send() a packet, as before)
@@ -831,10 +837,16 @@ uint16_t runSession(Link& L, uint32_t serial) {
         // (something already in the TLS layer: a moment only, but always a wait, as part of a record
         // reads as nothing yet and this loop would otherwise go round without letting anyone else run)
         // (while the mic records, a packet is ready every 20 ms: looked for every 5)
-        // (and while the screen's shared, every 1: a frame comes every 16.7 ms, and one waiting up to 5 ms
-        // here to be sent arrived as unevenly)
-        poll(p, s.udp >= 0 ? 2 : 1,
-             s.tls.pending() || (s.stream && screen::active()) ? 1 : (mic::active() || screen::active()) ? 5 : WAIT_MS);
+        // (and while the screen's shared, woken by capture itself when a frame or a sound packet's ready: a
+        // frame waiting up to 5 ms here arrived as unevenly, and polling every 1 ms instead was a thousand
+        // calls a second into the system's sockets, all on core 3. The sockets looked at without waiting
+        // then, and at least every 5 ms)
+        if (s.stream && screen::active() && !s.tls.pending()) {
+            screen::waitWork(5'000'000ULL);
+            poll(p, s.udp >= 0 ? 2 : 1, 0);
+        } else {
+            poll(p, s.udp >= 0 ? 2 : 1, s.tls.pending() ? 1 : (mic::active() || screen::active()) ? 5 : WAIT_MS);
+        }
         now = nowMs();
         alive = s.ws.poll(0, &s) && !s.dead;
         if (s.udp >= 0) s.udpPackets(now);
@@ -866,10 +878,14 @@ uint16_t runSession(Link& L, uint32_t serial) {
         }
         if (s.stream && now >= s.next_stats) {
             // (this thread's share of a core since the last stats: encrypting and sending the video)
-            uint64_t cpu = 0, at = armGetSystemTick();
+            // (and how much of core 3, everyone's, sat idle: little, and the sending waits on the others there)
+            uint64_t cpu = 0, idle = 0, at = armGetSystemTick();
             svcGetInfo(&cpu, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, TickCountInfo_Total);
-            if (s.cpu_at && at > s.cpu_at) say("stream: %u%% of a core", (unsigned)((cpu - s.cpu_ticks) * 100 / (at - s.cpu_at)));
-            s.cpu_ticks = cpu, s.cpu_at = at;
+            svcGetInfo(&idle, InfoType_IdleTickCount, INVALID_HANDLE, (u64)-1);
+            if (s.cpu_at && at > s.cpu_at)
+                say("stream: %u%% of a core; core 3 idle %u%%", (unsigned)((cpu - s.cpu_ticks) * 100 / (at - s.cpu_at)),
+                    (unsigned)((idle - s.idle_ticks) * 100 / (at - s.cpu_at)));
+            s.cpu_ticks = cpu, s.idle_ticks = idle, s.cpu_at = at;
             screen::Stats sc;
             screen::takeStats(&sc);
             say("screen: the recorder's frames %u skipped (we were too slow), %u dropped with no room to queue (the network's "
@@ -995,20 +1011,24 @@ void start(LogFn log, RandomFn rnd) {
     g_voice.s = &g_s, g_voice.bin = g_bin;
     g_stream.s = &g_ss, g_stream.bin = g_sbin;
     g_run = true;
-    // (just above the gateway's: its loop always waits, at least a millisecond, so the gateway runs.
-    // The stream's just below the call's: the call's sound first)
-    if (R_FAILED(threadCreate(&g_voice.thread, thread, &g_voice, nullptr, 0xA000, 0x28, -2))) {
+    // (all on core 3, lower numbers first: the system's sockets (bsd: 25 to 29), Chirp's mixer (30), the mic
+    // (36), the call (37), the screen's capture (39), then the stream (40): the call's sound before the
+    // video, and capture's quick reads never held up behind a keyframe's sending. Both above the gateway's
+    // (44): their loops always wait, at least a millisecond, so the gateway runs)
+    if (R_FAILED(threadCreate(&g_voice.thread, thread, &g_voice, nullptr, 0xA000, 0x25, -2))) {
         g_run = false;
         return;
     }
-    if (R_FAILED(threadCreate(&g_stream.thread, thread, &g_stream, nullptr, 0xA000, 0x29, -2))) {
+    if (R_FAILED(threadCreate(&g_stream.thread, thread, &g_stream, nullptr, 0xA000, 0x28, -2))) {
         g_run = false;
         threadClose(&g_voice.thread);
         g_voice.thread.handle = 0;
         return;
     }
     threadStart(&g_voice.thread);
+    cpushare::track(g_voice.thread.handle);
     threadStart(&g_stream.thread);
+    cpushare::track(g_stream.thread.handle);
 }
 
 void stop() {

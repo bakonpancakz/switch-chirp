@@ -115,7 +115,18 @@ void Aes::encryptSoft(const uint8_t in[AES_BLOCK], uint8_t out[AES_BLOCK]) const
 
 namespace {
 
+#if AES_HW
+void ghashHw(uint8_t y[16], const uint64_t hk[2], const uint8_t* p, size_t blocks);
+void ctrHw(const Aes& aes, uint8_t c[16], const uint8_t* in, uint8_t* out, size_t blocks);
+#endif
+
 void ghashBlocks(uint8_t y[16], const Gcm& g, const uint8_t* p, size_t n) {
+#if AES_HW
+    if (g_hw && n >= 16) {
+        ghashHw(y, g.hk, p, n / 16);
+        p += n & ~(size_t)15, n &= 15;
+    }
+#endif
     while (n) {
         size_t take = n < 16 ? n : 16;
         for (size_t i = 0; i < take; i++) y[i] ^= p[i];
@@ -183,6 +194,79 @@ void inc32(uint8_t c[16]) {
     for (int i = 15; i >= 12; i--)
         if (++c[i]) break;
 }
+
+#if AES_HW
+// The fast ways, for whole blocks (what video's frames are nearly all of): AES-CTR four blocks at a time
+// (each AESE waits on the one before it in its block: four blocks side by side keep the unit busy), the
+// round keys held in registers; and GHASH kept in vector registers from block to block, its multiply and
+// reduction there too (ghashMul's, the same steps), not through memory and general registers each block.
+
+// c: the counter block, incremented before each block's keystream (as inc32's); its last 4 bytes, big-endian
+void ctrHw(const Aes& aes, uint8_t c[16], const uint8_t* in, uint8_t* out, size_t blocks) {
+    uint8x16_t k[15];
+    for (int r = 0; r <= aes.rounds; r++) k[r] = vld1q_u8(aes.rk + 16 * r);
+    const int last = aes.rounds - 1;
+    uint32x4_t base = vreinterpretq_u32_u8(vld1q_u8(c));
+    uint32_t ctr = (uint32_t)c[12] << 24 | (uint32_t)c[13] << 16 | (uint32_t)c[14] << 8 | c[15];
+    while (blocks >= 4) {
+        uint8x16_t b0 = vreinterpretq_u8_u32(vsetq_lane_u32(__builtin_bswap32(ctr + 1), base, 3));
+        uint8x16_t b1 = vreinterpretq_u8_u32(vsetq_lane_u32(__builtin_bswap32(ctr + 2), base, 3));
+        uint8x16_t b2 = vreinterpretq_u8_u32(vsetq_lane_u32(__builtin_bswap32(ctr + 3), base, 3));
+        uint8x16_t b3 = vreinterpretq_u8_u32(vsetq_lane_u32(__builtin_bswap32(ctr + 4), base, 3));
+        ctr += 4;
+        for (int r = 0; r < last; r++) {
+            b0 = vaesmcq_u8(vaeseq_u8(b0, k[r]));
+            b1 = vaesmcq_u8(vaeseq_u8(b1, k[r]));
+            b2 = vaesmcq_u8(vaeseq_u8(b2, k[r]));
+            b3 = vaesmcq_u8(vaeseq_u8(b3, k[r]));
+        }
+        b0 = veorq_u8(vaeseq_u8(b0, k[last]), k[aes.rounds]);
+        b1 = veorq_u8(vaeseq_u8(b1, k[last]), k[aes.rounds]);
+        b2 = veorq_u8(vaeseq_u8(b2, k[last]), k[aes.rounds]);
+        b3 = veorq_u8(vaeseq_u8(b3, k[last]), k[aes.rounds]);
+        vst1q_u8(out, veorq_u8(vld1q_u8(in), b0));
+        vst1q_u8(out + 16, veorq_u8(vld1q_u8(in + 16), b1));
+        vst1q_u8(out + 32, veorq_u8(vld1q_u8(in + 32), b2));
+        vst1q_u8(out + 48, veorq_u8(vld1q_u8(in + 48), b3));
+        in += 64, out += 64, blocks -= 4;
+    }
+    for (; blocks; blocks--, in += 16, out += 16) {
+        uint8x16_t b = vreinterpretq_u8_u32(vsetq_lane_u32(__builtin_bswap32(++ctr), base, 3));
+        for (int r = 0; r < last; r++) b = vaesmcq_u8(vaeseq_u8(b, k[r]));
+        b = veorq_u8(vaeseq_u8(b, k[last]), k[aes.rounds]);
+        vst1q_u8(out, veorq_u8(vld1q_u8(in), b));
+    }
+    c[12] = (uint8_t)(ctr >> 24), c[13] = (uint8_t)(ctr >> 16), c[14] = (uint8_t)(ctr >> 8), c[15] = (uint8_t)ctr;
+}
+
+inline uint64x2_t pmullLo(uint64x2_t a, uint64x2_t b) {
+    return vreinterpretq_u64_p128(
+        vmull_p64(vgetq_lane_p64(vreinterpretq_p64_u64(a), 0), vgetq_lane_p64(vreinterpretq_p64_u64(b), 0)));
+}
+inline uint64x2_t pmullHi(uint64x2_t a, uint64x2_t b) {
+    return vreinterpretq_u64_p128(vmull_high_p64(vreinterpretq_p64_u64(a), vreinterpretq_p64_u64(b)));
+}
+
+// a * H, reduced: ghashMul's steps (Karatsuba; then the top 128 bits folded back in by x^128 = x^7+x^2+x+1).
+// a, h: each byte's bits reversed, as two little-endian words; hx's low word: H's two words XORed
+inline uint64x2_t gfmulHw(uint64x2_t a, uint64x2_t h, uint64x2_t hx) {
+    const uint64x2_t zero = vdupq_n_u64(0), poly = vdupq_n_u64(0x87);
+    uint64x2_t z0 = pmullLo(a, h), z2 = pmullHi(a, h);
+    uint64x2_t zm = veorq_u64(pmullLo(veorq_u64(a, vextq_u64(a, a, 1)), hx), veorq_u64(z0, z2));
+    uint64x2_t lo = veorq_u64(z0, vextq_u64(zero, zm, 1));  // (p0, p1)
+    uint64x2_t hi = veorq_u64(z2, vextq_u64(zm, zero, 1));  // (p2, p3)
+    uint64x2_t t = pmullLo(hi, poly), u = pmullHi(hi, poly), v = pmullHi(u, poly);
+    return veorq_u64(veorq_u64(lo, t), veorq_u64(vextq_u64(zero, u, 1), v));
+}
+
+// y (16 bytes, as GCM keeps it) through `blocks` whole blocks of p
+void ghashHw(uint8_t y[16], const uint64_t hk[2], const uint8_t* p, size_t blocks) {
+    uint64x2_t h = vld1q_u64(hk), hx = vdupq_n_u64(hk[0] ^ hk[1]);
+    uint64x2_t a = vreinterpretq_u64_u8(vrbitq_u8(vld1q_u8(y)));
+    for (; blocks; blocks--, p += 16) a = gfmulHw(veorq_u64(a, vreinterpretq_u64_u8(vrbitq_u8(vld1q_u8(p)))), h, hx);
+    vst1q_u8(y, vrbitq_u8(vreinterpretq_u8_u64(a)));
+}
+#endif
 
 }  // namespace
 
@@ -268,6 +352,13 @@ void Gcm::ghash(const uint8_t* aad, size_t aad_n, const uint8_t* ct, size_t n, u
 void Gcm::ctr(const uint8_t j0[AES_BLOCK], const uint8_t* in, size_t n, uint8_t* out) const {
     uint8_t c[16], ks[16];
     memcpy(c, j0, 16);
+#if AES_HW
+    if (g_hw && n >= 16) {
+        ctrHw(aes, c, in, out, n / 16);
+        size_t done = n & ~(size_t)15;
+        in += done, out += done, n -= done;
+    }
+#endif
     while (n) {
         inc32(c);
         aes.encrypt(c, ks);
@@ -322,16 +413,30 @@ void GcmStream::start(const Gcm& gcm, const uint8_t iv[GCM_IV]) {
 
 // (GHASH takes whole blocks: the AAD's last partial block is padded with zeros before the ciphertext's start)
 void GcmStream::hash(const uint8_t* p, size_t n) {
-    while (n) {
+    // a block begun by an earlier piece finished first (DAVE's pieces are any length: without this, once
+    // one ended mid-block every block after it went the slow way, copied through part)
+    if (part_n) {
         size_t take = 16 - part_n < n ? 16 - part_n : n;
         memcpy(part + part_n, p, take);
         part_n += take, p += take, n -= take;
-        if (part_n == 16) {
-            for (int i = 0; i < 16; i++) y[i] ^= part[i];
-            g->mulH(y);
-            part_n = 0;
-        }
+        if (part_n < 16) return;
+        for (int i = 0; i < 16; i++) y[i] ^= part[i];
+        g->mulH(y);
+        part_n = 0;
     }
+    // whole blocks straight from p
+#if AES_HW
+    if (g_hw && n >= 16) {
+        ghashHw(y, g->hk, p, n / 16);
+        p += n & ~(size_t)15, n &= 15;
+    }
+#endif
+    for (; n >= 16; p += 16, n -= 16) {
+        for (int i = 0; i < 16; i++) y[i] ^= p[i];
+        g->mulH(y);
+    }
+    memcpy(part, p, n);  // (the rest: the start of the next block)
+    part_n = n;
 }
 
 void GcmStream::flushPart() {
@@ -351,16 +456,33 @@ void GcmStream::encrypt(uint8_t* p, size_t n) {
         flushPart();
         in_ct = true;
     }
-    for (size_t i = 0; i < n; i++) {
+    keystream(p, n);
+    hash(p, n);
+    ct_n += n;
+}
+
+// (the keystream XORed in a block's worth at a time, not a byte and a test at a time: video's whole frames
+// go through here)
+void GcmStream::keystream(uint8_t* p, size_t n) {
+    while (n) {
+#if AES_HW
+        if (!ks_left && g_hw && n >= 16) {
+            ctrHw(g->aes, c, p, p, n / 16);
+            size_t done = n & ~(size_t)15;
+            p += done, n -= done;
+            continue;
+        }
+#endif
         if (!ks_left) {
             inc32(c);
             g->aes.encrypt(c, ks);
             ks_left = 16;
         }
-        p[i] ^= ks[16 - ks_left--];
+        size_t take = ks_left < n ? ks_left : n;
+        const uint8_t* k = ks + (16 - ks_left);
+        for (size_t i = 0; i < take; i++) p[i] ^= k[i];
+        p += take, n -= take, ks_left -= take;
     }
-    hash(p, n);
-    ct_n += n;
 }
 
 void GcmStream::decrypt(uint8_t* p, size_t n) {
@@ -370,14 +492,7 @@ void GcmStream::decrypt(uint8_t* p, size_t n) {
     }
     hash(p, n);
     ct_n += n;
-    for (size_t i = 0; i < n; i++) {
-        if (!ks_left) {
-            inc32(c);
-            g->aes.encrypt(c, ks);
-            ks_left = 16;
-        }
-        p[i] ^= ks[16 - ks_left--];
-    }
+    keystream(p, n);
 }
 
 void GcmStream::finish(uint8_t* tag, size_t tag_n) {
@@ -417,6 +532,34 @@ bool aesSelfTest(const char** what) {
             g.mulHTable(z);
             ok = !memcmp(y, z, 16);
             y[round] ^= 0xA5;
+        }
+        // whole messages, and DAVE's way in pieces, the fast way against the plain one (g_hw off): lengths
+        // around the 16-byte blocks and the 4-block batches
+        static uint8_t msg[300], ct_hw[300], ct_soft[300], piece[300];
+        uint8_t aad[20], iv[12], tag_hw[16], tag_soft[16], tag_st[16];
+        for (int i = 0; i < 300; i++) msg[i] = (uint8_t)(i * 7 + k * 13 + 3);
+        for (int i = 0; i < 20; i++) aad[i] = (uint8_t)(i * 11 + 1);
+        for (int i = 0; i < 12; i++) iv[i] = (uint8_t)(i * 5 + k);
+        static const size_t lens[] = {0, 1, 15, 16, 17, 47, 63, 64, 65, 80, 129, 300};
+        for (size_t len : lens) {
+            if (!ok) break;
+            g.seal(iv, aad, sizeof(aad), msg, len, ct_hw, tag_hw, 16);
+            g_hw = false;
+            g.seal(iv, aad, sizeof(aad), msg, len, ct_soft, tag_soft, 16);
+            g_hw = true;
+            ok = !memcmp(ct_hw, ct_soft, len) && !memcmp(tag_hw, tag_soft, 16);
+            // in pieces: odd sizes (the keystream's leftovers), then 48 at a time (whole blocks, the fast way)
+            for (int way = 0; way < 2 && ok; way++) {
+                GcmStream st;
+                st.start(g, iv);
+                st.aad(aad, 7);
+                st.aad(aad + 7, sizeof(aad) - 7);
+                memcpy(piece, msg, len);
+                for (size_t at = 0, step = way ? 48 : 5; at < len; at += step, step = way ? 48 : step * 3 % 97 + 1)
+                    st.encrypt(piece + at, step < len - at ? step : len - at);
+                st.finish(tag_st, 16);
+                ok = !memcmp(piece, ct_soft, len) && !memcmp(tag_st, tag_soft, 16);
+            }
         }
         g.wipeKey();
     }

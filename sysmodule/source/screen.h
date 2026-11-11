@@ -40,6 +40,8 @@ bool active();            // capturing
 // they wait for the next keyframe. done() hands it back
 bool take(uint8_t** frame, size_t* n, size_t* cap, uint64_t* tick, bool* gap);
 void done();
+// Until a frame or a sound packet is ready to take (at once if one is), or timeout_ns: false, the time ran out
+bool waitWork(uint64_t timeout_ns);
 
 // The game's sound as grc:d records it (48 kHz stereo), mixed to mono and encoded (opusenc.h): the
 // next packet, in order; false: none waiting

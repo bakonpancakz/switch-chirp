@@ -1,4 +1,5 @@
 #include "screen.h"
+#include "cpushare.h"
 
 #include <switch.h>
 #include <string.h>
@@ -65,6 +66,8 @@ AudioClock g_aclock;
 // the game's sound: 20 ms gathered, encoded, queued for the stream's connection (one writer, one reader)
 constexpr int AQ = 16;  // (320 ms: room while a keyframe goes out)
 AudioPacket g_aq[AQ];
+// (signalled when a frame or a sound packet is queued: the stream's thread waits on it, not on a 1 ms poll)
+UEvent g_work;
 uint32_t g_aq_head = 0, g_aq_tail = 0;  // (atomic: the audio thread writes at head, the stream reads at tail)
 OpusEnc g_enc;
 int16_t g_pcm[OPUSENC_FRAME];
@@ -141,6 +144,7 @@ void queue(u32 size, uint64_t tick) {
         if (g_run && sharing()) {
             g_q.push(g_buf, size, sizeof(g_buf), tick, g_gap);
             g_gap = false;
+            ueventSignal(&g_work);
             while (g_run && sharing() && !g_q.empty()) svcSleepThread(1'000'000LL);  // (g_buf is in use until then)
         }
     } else {
@@ -154,6 +158,7 @@ void queue(u32 size, uint64_t tick) {
                 queued = true;
             }
             mutexUnlock(&g_ring_lock);
+            if (queued) ueventSignal(&g_work);
             if (queued) break;
             if (msSince(w0) >= QUEUE_WAIT_MS) {
                 g_gap = true;
@@ -241,6 +246,7 @@ void audioSamples(const int16_t* stereo, size_t frames, uint64_t first_ns) {
         q.frame = frame;
         q.ns = g_pkt_ns;
         __atomic_store_n(&g_aq_head, head + 1, __ATOMIC_RELEASE);
+        ueventSignal(&g_work);
     }
 }
 
@@ -294,6 +300,7 @@ bool start() {
     mutexInit(&g_ring_lock);
     mutexInit(&g_title_lock);
     g_q.init(g_ring, sizeof(g_ring));
+    ueventCreate(&g_work, true);
     g_run = true;
     // (capture high: it does little but must read each frame while grc still has it)
     if (R_FAILED(threadCreate(&g_vthread, videoThread, nullptr, nullptr, 0x2000, 0x27, -2))) {
@@ -309,7 +316,9 @@ bool start() {
         return false;
     }
     threadStart(&g_vthread);
+    cpushare::track(g_vthread.handle);
     threadStart(&g_athread);
+    cpushare::track(g_athread.handle);
     return true;
 }
 
@@ -355,6 +364,14 @@ bool take(uint8_t** frame, size_t* n, size_t* cap, uint64_t* tick, bool* gap) {
 }
 
 void done() { g_q.done(); }
+
+bool waitWork(uint64_t timeout_ns) {
+    // (already something to take: no wait. A frame taken and not yet done() isn't something new)
+    if ((!g_q.empty() && !g_q.holding()) ||
+        __atomic_load_n(&g_aq_head, __ATOMIC_ACQUIRE) != __atomic_load_n(&g_aq_tail, __ATOMIC_ACQUIRE))
+        return true;
+    return R_SUCCEEDED(waitSingle(waiterForUEvent(&g_work), timeout_ns));
+}
 
 bool takeAudio(AudioPacket* p) {
     uint32_t tail = __atomic_load_n(&g_aq_tail, __ATOMIC_RELAXED);

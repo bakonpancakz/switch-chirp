@@ -132,6 +132,9 @@ sharing and the game shows nothing, Chirp sends one of them at random, again
 every 2 s, a new pick each time. They're read from the SD card when needed,
 so they cost no memory.
 
+The three that come with it (a little bird saying "Be right back", "On the HOME menu" and "Loading...")
+are drawn by `scripts/loading_art.py`. Delete them and drop in your own.
+
 ## Sounds
 
 Chirp plays short sounds for what happens in the call. They're WAVs in

@@ -1,252 +1,133 @@
-# Chirp
-
-Discord voice chat on a homebrew Nintendo Switch, through a bot of your own. A
-small sysmodule starts with the Switch and stays connected to Discord whatever
-runs in front (a game, the HOME menu, Melody playing). An overlay in
-Ultrahand's menu shows your servers and their voice channels, who's in them,
-and puts the bot in a call: you hear the call, talk through the headset's mic,
-and can share the game, picture and sound, as a Go Live stream.
-
-## What it does
-
-- **Home:** **Profile**, then your servers. Profile is three rows:
-  - Whether the bot is connected, or how long until it tries again (3 s at most). A on it retries now.
-  - The bot's picture and name. A on it opens **Select Login**: **Appear Invisible** (on by default: the bot
-    shows offline to everyone while Chirp stays connected, so it isn't online whenever the Switch is on) and the
-    bots in `token.ini`.
-  - **Rich Presence**: "Playing <game>" and for how long, real games only, not shown while invisible. A turns it
-    on and off.
-
-  The servers come sorted by name, each with its icon and how many are active in voice.
-- **Voice channels:** under their categories, sorted by name, each with how many are active in it. A channel:
-  **Join Channel** (muted if the bot was muted last time) and who's in it, by name.
-- **In a call:** "Chirp: <channel>" and how long it's been connected, then **Mute**, **Deafen**, **Screenshare**,
-  **Volume** (everyone, 0–200% in steps of 5%), **Settings** (a page of its
-  own) and **Disconnect**. X mutes and Y deafens from anywhere on that page. Then the
-  members by name, each with their picture (a green ring while they
-  talk) and their mute and deafen state.
-- **Someone in the call:** Mute and Volume (0–200%), which only change what
-  you hear, saved in `config/sys-chirp/people.ini`.
-- **Settings:** the mic's **Input Volume** (0–200%), **Input Sensitivity**
-  (Automatic, or -80 to -15 dB, with the mic's level shown live beside the
-  line to pick it by), **Automatic Gain Control**, **Noise Suppression** and
-  **HOME Input Indicator** (Off, or the light's 15 levels, 7–100%: the HOME button's ring on
-  every connected Pro Controller and right Joy-Con lights up while what you
-  say is being sent; not on a Switch Lite), kept in `settings.ini`. Then the Debug sections:
-  - **Debug: Screenshare:** the colour range the recorder labels its video with, the frame rate it records at
-    (30, or 60 with `continuous_recording_fps`), and frames sent a second, bitrate, late frames, packets viewers
-    lost and the biggest frame.
-  - **Debug: Network:** the gateway's, the call's and the stream's pings, and the voice and stream servers.
-  - **Debug: Audio:** people followed, decoders in use, the mic's gain.
-  - **Debug: System:** memory, and how idle core 3 is next to Chirp's own share of it.
-- **Hearing:** each person's Opus packets go through a small jitter buffer
-  (20 ms cushion) to the Switch's hardware Opus decoders (eight people
-  followed, four heard at once), mixed and played through audout (100 ms
-  queued).
-- **Talking:** the default mic (a headset's) at 48 kHz, the input volume,
-  noise suppression (RNNoise v0.2, its full model, if on; 10 ms more delay), a 100 Hz high-pass for rumble, then the input sensitivity decides if it's
-  talk: two 20 ms frames in a row over the line (so a click or a button press
-  never opens the mic, and the first frame still goes out). Then automatic
-  gain (if on) and Chirp's own Opus encoder (64 kbps). It only sends while
-  you talk.
-- **Screenshare:** a Go Live stream of what the Switch records (grc:d, the
-  service SysDVR uses): 1280x720 H.264 at the Switch's recording rate (30 frames a second, 60 with
-  `continuous_recording_fps=u32!60` under `[am.debug]` in `system_settings.ini`), labelled with the colour range the
-  recorder gives it, and the game's
-  sound (mono Opus, 96 kbps), on its own connection. When there's no picture
-  (no game, the HOME menu), viewers see a loading screen (below), or grey.
-- **Encryption:** Discord's end-to-end encryption (DAVE, on MLS) for sound
-  and video, and the transport's AES-256-GCM.
-
-Names: someone's server nickname, else their display name, else their
-username.
-
-## What you need
-
-- Firmware 23.0.0 or newer with **Atmosphère 1.12.2** or newer (23.5.0 needs 1.12.2), and
-  [Ultrahand Overlay](https://github.com/ppkantorski/Ultrahand-Overlay). Older firmware gives sysmodules too
-  little memory for Chirp (see [How it's made](#how-its-made)).
-- The Switch on Wi-Fi
-- A Discord bot (below). It's free and takes a few minutes.
-
-## Making the bot
-
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
-   and press **New Application**. Its name is the bot's name in calls.
-2. **Bot** tab: **Reset Token**, then copy the token. Keep it secret: it's the
-   bot's password. No privileged intents are needed (Chirp only asks for
-   Guilds and Guild Voice States).
-3. **OAuth2** tab, **URL Generator**: tick the `bot` scope, then the permissions
-   **View Channels**, **Connect**, **Speak** and **Video** (for Screenshare).
-   Open the URL it makes and add the bot to your servers (you need Manage
-   Server on each).
-
-## Installing
-
-1. Build it (see below), or take the files from a release.
-2. Copy everything in `dist/` to the root of the SD card:
-
-   | On the card | What it is |
-   | --- | --- |
-   | `atmosphere/contents/420000000000C4A7/` | the sysmodule (`exefs.nsp`, `flags/boot2.flag`, `toolbox.json`) |
-   | `switch/.overlays/chirp.ovl` | the overlay |
-   | `config/sys-chirp/token.example.txt` | where the token goes |
-   | `config/sys-chirp/loading/*.h264` | loading screens for Screenshare (if you made any) |
-   | `config/sys-chirp/sounds/*.wav` | the call's sounds (`voice_*`, `screenshare_*`) |
-
-3. In `sdmc:/config/sys-chirp/`, make **`token.ini`** with a line for each bot:
-   `My Bot=<token>`. The overlay's Select Login picks between them, and
-   `settings.ini` remembers which. (Or **`token.txt`**, with just one token on
-   its first line.)
-4. Restart the Switch. Open Ultrahand and pick **Chirp**: the top row should
-   show your bot, **Connected**.
-
-The token only lives in `token.txt` on your SD card. Chirp's log
-(`config/sys-chirp/chirp.log`) never has it. Lines are queued in memory and
-written by a thread of their own a moment later, so nothing waits on the SD
-card (the call's sound did, once). The file is opened and closed for each
-batch, so FTP can copy it while Chirp runs. Settings and volumes are saved a
-second after their last change.
-
-## When something's wrong
-
-The overlay's top line says what the sysmodule is doing, and the log says
-more.
-
-- **No bot token:** `token.txt` isn't there, or it's empty, or it holds
-  something that can't be a token.
-- **Discord turned the token down:** Discord closed the session with 4004.
-  Copy the token again (Reset Token makes a new one), then press A on the status row (**Retry**).
-- **Offline:** no network, or the connection broke. Chirp starts a new session by
-  itself, waiting 1, 2, then 3 seconds between tries.
-
-When a session ends for any reason, everything is dropped and the next one
-starts from scratch (no resuming).
-
-## Loading screens
-
-Put PNGs (or JPGs) in `loading/` before building. Each becomes one 1280x720
-H.264 keyframe (about 100 KB) in `dist/config/sys-chirp/loading/`, made with
-ffmpeg (on the PATH, or `$env:FFMPEG` in `toolchain.local.ps1`). While
-sharing and the game shows nothing, Chirp sends one of them at random, again
-every 2 s, a new pick each time. They're read from the SD card when needed,
-so they cost no memory.
-
-The three that come with it (a little bird saying "Be right back", "On the HOME menu" and "Loading...")
-are drawn by `scripts/loading_art.py`. Delete them and drop in your own.
-
-## Sounds
-
-Chirp plays short sounds for what happens in the call. They're WAVs in
-`config/sys-chirp/sounds/`:
-
-| File | When |
-| --- | --- |
-| `voice_join.wav` | you join a call, or someone comes into your channel |
-| `voice_leave.wav` | you leave it, or someone goes out of it |
-| `screenshare_join.wav` | someone starts watching your screen share |
-| `screenshare_leave.wav` | someone stops watching it |
-| `stream_start.wav` / `stream_stop.wav` | your screen share goes live, or ends (while you're still in the call) |
-| `mute.wav` / `unmute.wav` | you're muted or unmuted (once Discord has it, in a call) |
-| `deafen.wav` / `undeafen.wav` | you're deafened or undeafened (unmuting while deafened undeafens) |
-
-The log also says how many are watching.
-
-Swap any of them for your own: 16-bit PCM WAV, mono or stereo, 8 to 48 kHz.
-They're mixed to mono and played at a third of your volume (under people's voices). The call's ones aren't played while you're deafened;
-your own mute and deafen ones are, so you hear yourself deafen.
-Each is read from the card when it plays, into one 48 KB buffer: up to 1 s at
-24 kHz, 0.5 s at 48 kHz. Anything longer is cut with a short fade. Delete one
-to silence it. The ones that come with Chirp are in the spirit of the old
-Skype, soft like a bubble bath: deep, watery "bloops" in a small room. They
-rise for a join and fall for a leave, and are made by `scripts/chimes.py`.
-The call's are two quick bubbles; the screen share's are three, deeper and
-slower. `python scripts/chimes.py
-bells` makes the plain bell chimes instead.
-
-## How it's made
-
-Everything the sysmodule keeps is in fixed tables and buffers. Nothing is
-allocated as it runs, so its memory is known at build time
-(`aarch64-none-elf-size chirp.elf`), about 6.2 MB in all. That needs more room than stock
-Atmosphère gives sysmodules on firmware 20 to 22 (7 MB extra on 21+, shared by all of them; on
-22.5.0, 1 MB was left in a game before v0.2). Firmware 23.0.0+ with Atmosphère 1.12.1+ gives 40 MB
-(on 23.5.0 with 1.12.2, about 26 MB was left with Chirp and a handful of other sysmodules running).
-On 22.x, raise `ExtraSystemMemoryForAtmosphere_21_0_0` in mesosphere's
-`kern_k_system_control.cpp` (14 MB works; the browser applets get that much less):
-
-| | |
-| --- | --- |
-| code and constants (RNNoise v0.2's weights are 3.2 MB of it) | ~3.6 MB |
-| grc:d's buffer (its biggest keyframe) and the queue of frames being sent (768 KB: 10 Mbps with room for spikes) | ~1.1 MB |
-| two voice connections (the call's and the stream's): DAVE's MLS state and room for a Welcome each | ~380 KB |
-| the lists (`store.cpp`), the mixer, the mic | ~200 KB |
-| heap, for what libnx hands the system (the sockets' buffers, 87 KB; four hardware Opus decoders, 48 KB each) and the threads' stacks | 608 KB |
-
-- **TLS** is the Switch's own ssl service, so there's no TLS library in here.
-- **The websocket** (`ws.cpp`), **JSON** (`json.cpp`, read as it streams in,
-  a value at a time with its path) and **the gateway** (`gateway.cpp`) are
-  written by hand.
-- **The voice connection** (`voice.cpp`): voice gateway v8, UDP with IP
-  discovery, RTP with AES-256-GCM (`rtp.cpp`). Go Live is a second one, to the
-  stream's own server.
-- **Screenshare** comes in three parts.
-  - **Capture** (`screen.cpp`) reads grc:d. Video is asked for only while a
-    title runs: a game, or sphaira and whatever runs in it (its video
-    capture setting isn't checked: an installer's patch may lift it). It
-    also waits a couple of seconds after the title opens. A
-    request made while nothing records is never answered, and was stuck
-    until a restart.
-  - **The send queue** (`framequeue.cpp`) and **the recorder's clocks**
-    (`screenclock.cpp`) sit between capture and sending. The clocks track
-    frames missed and holes in the sound.
-  - **What's sent** (`share.cpp`) decides frame by frame: the game's frames,
-    waits for a keyframe after a loss, and loading screens or grey when
-    there's no picture. `voice.cpp` only encrypts and sends what it's given.
-    The queue, clocks and decisions are tested on a PC with stand-ins.
-- **DAVE** (`dave.cpp`, `mlsgroup.cpp`, `ratchet.cpp`, `p256.cpp`...): MLS
-  1.0 with P-256, written out and checked against another MLS library (ts-mls) and the
-  MLS test vectors. Video frames are encrypted as libdave does, the H.264
-  headers left readable.
-- **The Opus encoder** (`opusenc.cpp`): CELT only, mono, fixed size per
-  packet, checked against libopus bit for bit.
-- **H.264** (`rtp.cpp`): packetized by hand (FU-A); the recorder's SPS and
-  PPS put before every keyframe (it only sends them when a game starts), its
-  SPS given the bitstream restriction WebRTC would otherwise rewrite (and
-  break DAVE's tag over); the grey frame is written macroblock by macroblock.
-
-## Building
-
-You need [devkitPro](https://devkitpro.org/wiki/Getting_Started) with
-`switch-dev` installed. On Windows:
-
 ```
-./build.ps1           # the sysmodule and the overlay, laid out in dist/
-./build.ps1 sysmodule # only the sysmodule
-./build.ps1 clean
+----------------
+   sys-chirp
+----------------
+
+A discord client for the Nintendo Switch which supports RPC, voice chat, and
+screensharing. Additionally includes other helpful features such as:
+
+- Noise Suppression (via RNNoise v0.2)
+- HOME Button Talking Indicator
+- Avatars and Server Icons in the Overlay
+- Global volume and per user volume controls (0%-200% sliders)
+- Full Range Colorspace Support
+
+<!> For this sysmodule you will require either 8MB of free sysmodule memory or
+    the latest custom firmware (Currently: AMS 1.12.2; FW 23.5.0)
+
+<!> Although technically this project does support User Tokens it is against 
+    the Discord ToS, use them at your own risk.
+
+[ Made with AI ]
+
+
+----------------
+  Installation
+----------------
+
+(1) Install Ultrahand
+(2) Create a Bot and retrieve its token
+(3) Invite the bot with permission to: View Channels, Connect, Speak, and Video.
+(4) Copy the atmosphere, config, and switch folders from 'sys-chirp.zip' to the 
+    root of your SD Card.
+(5) Optionally (read below), Copy the atmosphere folder from 'patches.zip' to 
+    the root of your SD Card.
+(6) Place token into '/config/sys-chirp/token.ini' on your SD Card similar to 
+    the following format. (or use 'token.example.ini' which is already there)
+
+"""
+Bot #1=xxxxxxxx.xxxxxxxxxxxxxxxxxxxx.xxxxxxxxxx
+Bot #2=xxxxxxxx.xxxxxxxxxxxxxxxxxxxx.xxxxxxxxxx
+"""
+
+(7) Restart your Nintendo Switch if already powered on, DO IT.
+(8) Open Ultrahand and select Chirp, from there you can configure it further.
+
+
+----------------
+    Patches
+----------------
+
+For the best experience we recommend installing a series of patches and 
+configuration values to your switch. They are optional but should be installed
+together as alone they introduce a series of minor but still present side 
+effects (lame)
+
+Compatible with the following firmware versions, do not install if your 
+firmware is not listed:
+- 23.5.0
+
+|  Configuring Atmosphere  |
+
+Append the following options to your atmosphere configuration located at
+'sdmc:/atmosphere/config/system_settings.ini'
+
+"""
+[am.debug]
+continuous_recording_fps = u32!60
+continuous_recording_key_frame_count = u32!60
+continuous_recording_video_bit_rate = u32!7000000
+"""
+
+Your switch will now record videos at 60 FPS and record at a slightly better
+quality at the cost of consuming a little more disk space per recording.
+
+|  Installing System Patches  |
+
+Provided separately as 'patches.zip' they will improve your switch by:
+
+<?> Prevent the HOME overlay from ducking audio (breaks the game volume slider)
+<?> Allows the switch to record and playback Full RGB Color improving the color
+    accuracy of recordings.
+<?> Slightly improves recording quality by using the video encoder’s highest 
+    quality preset
+<?> Patches the Album applet to properly playback these new recording features.
+
+|  Third-Party Patches  |
+
+I recommend installing 'dvr-patches' as it allows games that block recording to 
+be streamed and disables watermarks (most notoriously project diva)
+
+https://github.com/exelix11/dvr-patches
+
+
+----------------
+    Caveats
+----------------
+
+<!> Screenshare can only display the active game, entering the HOME menu or
+    the appearance of certain menus will cause a "Be Right Back" screen to be 
+    sent instead. You can create your own with the included python scripts or
+    delete them all to use the internal solid grey placeholder instead.
+    
+    NOTE: Originally Chirp did share the entire screen but certain applets and
+    menus caused the cpu core reserved for system to cap out, and I considered
+    it too buggy and resource intensive for not much gain.
+
+<!> Bots cannot share their screen, you will be disconnected by Discord for
+    attempting to do so.
+
+<!> A headset with a microphone attached to the headphone jack is required to
+    speak as the Nintendo Switch itself does not include a microphone (lame)
+
+<!> Up to eight people can be heard speaking at once.
+
+Include your logfile at 'sdmc:/config/sys-chirp/chirp.log' if you are reporting
+an issue.
+
+
+----------------
+  Screenshots
+----------------
 ```
 
-## Tests
-
-`test/run.sh` builds the PC tests with a native gcc and runs them:
-
-```
-PATH=/c/msys64/ucrt64/bin:$PATH sh test/run.sh
-```
-
-They cover the JSON reader, the websocket and gateway against a pretend
-Discord (in random-sized pieces), the store, the mixer and jitter buffer, the
-crypto (AES-GCM, SHA-2, HKDF, P-256, HPKE), MLS against its test
-vectors and ts-mls, DAVE frames (Opus and H.264), the Opus encoder against
-libopus, RNNoise against xiph's, and the H.264 packetizer, SPS fix and grey
-frame (`test/check_grey.py` reads the grey frame back as a decoder would).
-
-## What it can't do
-
-- **DM calls.** Bots can't join them.
-- **More than four people talking at once** are heard four at a time (the
-  hardware decoders, 48 KB each); a ninth person isn't followed until one of
-  the eight goes quiet for 5 s.
-- **Lost video packets aren't sent again**: one lost on the way breaks the
-  picture until the next keyframe (two a second).
-- **Go Live as a bot** may need Discord to allow it for your bot.
+<table>
+  <tr>
+    <td width="50%"><img src=".github/preview-desktop-client.png" alt="Discord on PC watching the Switch's Go Live stream at 720p 60 fps"></td>
+    <td width="50%"><img src=".github/preview-guilds.jpg" alt="Chirp's overlay: connection status, Rich Presence and servers"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src=".github/preview-channel-quickactions.jpg" alt="In a call: Mute, Deafen, Screenshare, Volume, Settings, Disconnect"></td>
+    <td width="50%"><img src=".github/preview-channel-users.jpg" alt="The call's active members"></td>
+  </tr>
+</table>

@@ -20,7 +20,8 @@
 // 608 KB since Go Live: the stream's connection (its stack, 40 KB) and a bigger socket pool (+53 KB) left
 // 480 KB with no room for the screen's threads.
 // 776 KB since UDP's send buffer went from 9 to 64 KB: the socket pool grew by (64 - 9) x 3 = 165 KB, plus a page
-#define INNER_HEAP_SIZE 0xC2000
+// 968 KB since the decoders went from 4 to 8: everyone followed is heard at once (+4 x 48 KB)
+#define INNER_HEAP_SIZE 0xF2000
 
 extern "C" {
 
@@ -208,6 +209,7 @@ bool handle() {
         case ChirpCmd_SetFullRange:
         case ChirpCmd_SetInvisible:
         case ChirpCmd_SetRichPresence:
+        case ChirpCmd_SetGameVolume:
         case ChirpCmd_SoundCheck: {
             u32 cmd = h->command_id, v = 0;
             if (!inData(req, &v)) {
@@ -221,6 +223,7 @@ bool handle() {
             else if (cmd == ChirpCmd_SetFullRange) app::setFullRange(v != 0);
             else if (cmd == ChirpCmd_SetInvisible) app::setInvisible(v != 0);
             else if (cmd == ChirpCmd_SetRichPresence) app::setRichPresence(v != 0);
+            else if (cmd == ChirpCmd_SetGameVolume) app::setGameVolume((int)v);
             else app::soundCheck(v != 0);
             reply(0, nullptr, 0);
             break;

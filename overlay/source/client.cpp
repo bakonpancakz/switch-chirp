@@ -112,6 +112,7 @@ void setUserMute(u64 user, bool on) { setUser(ChirpCmd_SetUserMute, user, on); }
 void setUserVolume(u64 user, int volume) { setUser(ChirpCmd_SetUserVolume, user, (u32)volume); }
 void soundCheck(bool on) { setU32(ChirpCmd_SoundCheck, on); }
 void setVolume(int volume) { setU32(ChirpCmd_SetVolume, (u32)volume); }
+void setGameVolume(int volume) { setU32(ChirpCmd_SetGameVolume, (u32)volume); }
 
 void setMic(int volume, int sensitivity, bool agc, bool denoise, int home_light) {
     ChirpMic m = {(uint16_t)volume, (int8_t)sensitivity, (uint8_t)(agc ? 1 : 0), (uint8_t)(denoise ? 1 : 0),

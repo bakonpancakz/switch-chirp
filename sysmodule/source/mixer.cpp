@@ -206,7 +206,7 @@ void outClose() {
 
 // --- the call: each speaker's packets in a jitter buffer, decoded by a hardware decoder lent to them ---
 
-constexpr int DECODERS = 4;         // speakers heard at once (48 KB of work memory each, from the heap)
+constexpr int DECODERS = 8;         // speakers heard at once: all MIXER_SPEAKERS (48 KB of work memory each, from the heap)
 constexpr uint64_t DECODER_IDLE_MS = 2000, SPEAKER_GONE_MS = 5000, SPEAKING_MS = 250;
 constexpr int SPEAKING_DB = 50;     // louder than -50 dBFS: speaking
 

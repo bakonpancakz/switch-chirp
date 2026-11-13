@@ -8,7 +8,8 @@
 
 namespace game {
 
-uint64_t running() {
+uint64_t running(uint64_t* out_pid) {
+    if (out_pid) *out_pid = 0;
     // (one session, kept; opened once though two threads ask: the network's and the screen's)
     static Mutex lock = 0;
     static bool pm = false;
@@ -18,6 +19,7 @@ uint64_t running() {
     if (!pm) return 0;
     u64 pid = 0, tid = 0;
     if (R_FAILED(pmdmntGetApplicationProcessId(&pid)) || R_FAILED(pmdmntGetProgramId(&tid, pid))) return 0;
+    if (out_pid) *out_pid = pid;
     return tid;
 }
 

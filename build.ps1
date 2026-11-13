@@ -33,7 +33,7 @@ if ($Target -eq "clean") {
 
 Invoke-Make "sysmodule" ""
 
-# the sysmodule: starts with every boot (boot2.flag) and connects once token.txt is there
+# the sysmodule: starts with every boot (boot2.flag) and connects once token.ini (or token.txt) is there
 # (copied for the "sysmodule" target too: once it wasn't, and builds that never reached dist got "tested")
 $sys = Join-Path $PSScriptRoot "dist\atmosphere\contents\420000000000C4A7"
 New-Item -ItemType Directory -Force (Join-Path $sys "flags") | Out-Null
@@ -57,6 +57,8 @@ New-Item -ItemType Directory -Force $ovl | Out-Null
 Copy-Item (Join-Path $PSScriptRoot "overlay\chirp.ovl") (Join-Path $ovl "chirp.ovl")
 Write-Host "the overlay is in $ovl"
 
-# where token.txt goes (not made: it's yours to put there)
-New-Item -ItemType Directory -Force (Join-Path $PSScriptRoot "dist\config\sys-chirp") | Out-Null
-Copy-Item (Join-Path $PSScriptRoot "extras\token.example.txt") (Join-Path $PSScriptRoot "dist\config\sys-chirp\token.example.txt")
+# where token.ini goes: only an example is shipped, so copying dist to the card never overwrites a real one
+$cfg = Join-Path $PSScriptRoot "dist\config\sys-chirp"
+New-Item -ItemType Directory -Force $cfg | Out-Null
+Copy-Item (Join-Path $PSScriptRoot "extras\token.example.ini") (Join-Path $cfg "token.example.ini")
+Remove-Item -ErrorAction SilentlyContinue (Join-Path $cfg "token.example.txt"), (Join-Path $cfg "token.ini")

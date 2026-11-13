@@ -1,1 +1,0 @@
-Put your bot's token here, on the first line, alone, and save this file as token.txt

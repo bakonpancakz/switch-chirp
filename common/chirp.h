@@ -10,13 +10,15 @@
 #define CHIRP_DIR_SHOWN "/config/sys-chirp"  // (as the overlay names it)
 #define CHIRP_DIR "sdmc:" CHIRP_DIR_SHOWN
 #define CHIRP_TOKEN_TXT CHIRP_DIR "/token.txt"
-#define CHIRP_TOKEN_INI CHIRP_DIR "/token.ini"        // Name=token, one bot a line: the overlay's Login As (token.txt: just one)
+#define CHIRP_TOKEN_INI CHIRP_DIR "/token.ini"        // Name=token, one bot a line: the overlay's Profile picks one (token.txt: just one)
 #define CHIRP_SETTINGS_INI CHIRP_DIR "/settings.ini"  // which login, the mic's settings
 #define CHIRP_LOG CHIRP_DIR "/chirp.log"
 #define CHIRP_PEOPLE_INI CHIRP_DIR "/people.ini"  // our mute and volume for people (store.h)
 #define CHIRP_LOADING CHIRP_DIR "/loading"  // *.h264: keyframes shown while sharing and the game shows nothing (scripts/loading.ps1)
-#define CHIRP_AVATARS CHIRP_DIR "/avatars"
-#define CHIRP_SOUNDS CHIRP_DIR "/sounds"  // voice_join.wav, voice_leave.wav, screenshare_join.wav, screenshare_leave.wav, stream_start.wav, stream_stop.wav, mute.wav, unmute.wav, deafen.wav, undeafen.wav (sounds.h)  // {ChirpMember.avatar}.png, fetched by the sysmodule
+#define CHIRP_AVATARS CHIRP_DIR "/avatars"  // {ChirpMember.avatar}.png, fetched by the sysmodule
+// voice_join.wav, voice_leave.wav, screenshare_join.wav, screenshare_leave.wav, stream_start.wav,
+// stream_stop.wav, mute.wav, unmute.wav, deafen.wav, undeafen.wav (sounds.h)
+#define CHIRP_SOUNDS CHIRP_DIR "/sounds"
 
 // A name as it's kept and shown: UTF-8, cut (with "…") to fit, NUL-terminated
 #define CHIRP_NAME 48
@@ -37,7 +39,7 @@ enum ChirpCmd {
     ChirpCmd_SetUserMute = 9,    // in ChirpUserSetting (value 0/1): only for us, nobody else hears it
     ChirpCmd_SetUserVolume = 10, // in ChirpUserSetting (value 0..200, percent)
     ChirpCmd_SoundCheck = 11,    // in u32 0/1: test tones through the mixer
-    ChirpCmd_Reload = 12,        // read token.txt again and start a new session
+    ChirpCmd_Reload = 12,        // read token.ini (or token.txt) again and start a new session
     ChirpCmd_SetVolume = 13,     // in u32 0..200 (percent): everything Chirp plays
     ChirpCmd_SetScreenShare = 14, // in u32 0/1: the game's video into the call (when Discord takes a bot's)
     ChirpCmd_SetRichPresence = 15, // in u32 0/1: "Playing <the game>" on the bot (kept in settings.ini)
@@ -47,14 +49,15 @@ enum ChirpCmd {
     ChirpCmd_GetDebug = 19,       // out buffer ChirpDebug
     ChirpCmd_SetFullRange = 20,   // in u32 0/1: label the screen's video full range, whatever grc says (kept in settings.ini)
     ChirpCmd_SetInvisible = 21,   // in u32 0/1: the bot appears offline while connected (kept in settings.ini)
+    ChirpCmd_SetGameVolume = 22,  // in u32 0..100 (percent): the game's own sound, apart from the call's (kept in settings.ini)
 };
 
 // Raised when the commands change. The overlay says so when the sysmodule
 // running is older (it's only loaded again when the Switch restarts).
-#define CHIRP_PROTOCOL 12
+#define CHIRP_PROTOCOL 13
 
 enum ChirpConn {
-    ChirpConn_NoToken = 0,     // no token.txt (or it's empty)
+    ChirpConn_NoToken = 0,     // no token.ini or token.txt (or no token in them)
     ChirpConn_Offline = 1,     // no network, or it went away: trying again in retry_in_s
     ChirpConn_Connecting = 2,  // TLS, the websocket, Hello, Identify, waiting for READY
     ChirpConn_Online = 3,      // READY came: the lists are filled in
@@ -107,7 +110,8 @@ typedef struct ChirpStatus {
     uint8_t invisible;          // the bot appears offline: 0/1
     uint8_t rich_presence;      // "Playing <the game>": 0/1
     uint8_t mic_home_light;     // the HOME button's light while talking: 0 off, else 10..100 (percent)
-    uint8_t pad3[2];
+    uint8_t game_volume;        // the game's own volume: 0..100 (percent) (protocol 13)
+    uint8_t pad3[1];
     char game[CHIRP_NAME];      // what Rich Presence says it's playing (empty: nothing)
 } ChirpStatus;
 

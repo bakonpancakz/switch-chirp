@@ -8,8 +8,8 @@
 
 namespace game {
 
-// The running application's program id (0: none, e.g. the home menu)
-uint64_t running();
+// The running application's program id (0: none, e.g. the home menu); pid (if given): its process id
+uint64_t running(uint64_t* pid = nullptr);
 // Its name, as the game gives it (English if it has it); false: not now (no buffer, or no data).
 // video_capture (if given): whether it lets the system record video (its control data's VideoCapture:
 // 0 no, 1 on request, 2 always; -1 unknown)

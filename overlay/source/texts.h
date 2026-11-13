@@ -14,41 +14,33 @@ namespace txt {
 
 // --- the main menu ---
 inline constexpr const char* TITLE = "Chirp";
-inline constexpr const char* RETRY = "Retry";  // (A on the status: a new session now)
-inline constexpr const char* RPC_IDLE = "(no game open)";  // (Home's Rich Presence row: on, no game running)
-inline constexpr const char* RPC_OFF = "(disabled)";
 inline constexpr const char* ACTIVE_N = "%u active";  // (a server's or a channel's people in voice)
 inline constexpr const char* SERVERS = "Servers";
 inline constexpr const char* NO_SERVERS = "The bot isn't in any server yet";
 inline constexpr const char* CARET = "\uE14A";  // (on what opens a page: Ultrahand's own, its DROPDOWN_SYMBOL)
 
-// --- Select Login (A on the bot at the top) ---
-inline constexpr const char* SELECT_LOGIN = "Select Login";
+// --- Profile (A on the bot at the top) ---
+inline constexpr const char* PROFILE = "Profile";
+inline constexpr const char* GAME_VOLUME = "Game Volume";  // (the game's own sound, apart from the call's)
+inline constexpr const char* CALL_VOLUME = "Call Volume";  // (everything Chirp plays)
 inline constexpr const char* LOGINS_HINT = "Hint! Tokens are stored in 'sdmc:" CHIRP_DIR_SHOWN "/token.ini' !";
 inline constexpr const char* LOGINS_NONE = "No bots in " CHIRP_DIR_SHOWN "/token.ini";
 inline constexpr const char* LOGINS_HOW = "One a line: Name=token";
 inline constexpr const char* ACTIVE = "Active";
 inline constexpr const char* STATUS = "Status";
 inline constexpr const char* INVISIBLE = "Appear Invisible";  // (offline to everyone, still connected)
-inline constexpr const char* RICH_PRESENCE = "Rich Presence";  // ("Playing <the game>"; not shown while invisible)
+inline constexpr const char* GAME_ACTIVITY = "Game Activity";  // ("Playing <the game>"; not shown while invisible)
 inline constexpr const char* LOGINS = "Logins";
-inline constexpr const char* ST_INVISIBLE = "Connected, invisible";
-inline constexpr const char* ST_PLAYING = "Playing %s";
 
-// the status line at the top (what the sysmodule says)
+// the status line under the bot (what the sysmodule says): the game with Game Activity on, else how it's
+// connected. The token's troubles: fix token.ini, then pick the bot in Profile (that tries again)
 inline constexpr const char* ST_ONLINE = "Connected";
-inline constexpr const char* ST_ONLINE_SUB = "as %s";
-inline constexpr const char* ST_CONNECTING = "Connecting...";
-inline constexpr const char* ST_OFFLINE = "Offline";
-inline constexpr const char* ST_OFFLINE_SUB = "Retrying (%us)";  // (short: Retry sits beside it)
-inline constexpr const char* ST_NO_TOKEN = "No bot token";
-inline constexpr const char* ST_NO_TOKEN_SUB = "Put it in " CHIRP_DIR_SHOWN "/token.ini";
+inline constexpr const char* ST_INVISIBLE = "Invisible";
+inline constexpr const char* ST_RECONNECTING = "Reconnecting";
+inline constexpr const char* ST_NO_TOKEN = "No token: see " CHIRP_DIR_SHOWN "/token.ini";
 inline constexpr const char* ST_BAD_TOKEN = "Discord turned the token down";
-inline constexpr const char* ST_BAD_TOKEN_SUB = "Check token.txt, then Connect Again";
 inline constexpr const char* ST_REFUSED = "Discord closed the session (%u)";
-inline constexpr const char* ST_REFUSED_SUB = "See " CHIRP_DIR_SHOWN "/chirp.log";
 inline constexpr const char* ST_NOT_RUNNING = "Chirp isn't running";
-inline constexpr const char* ST_NOT_RUNNING_SUB = "Restart the Switch after installing it";
 inline constexpr const char* ST_OUTDATED = "Restart the Switch to update Chirp";
 
 // --- a server ---

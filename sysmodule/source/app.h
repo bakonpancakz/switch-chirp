@@ -31,6 +31,7 @@ void setInvisible(bool on);     // (the bot offline to everyone while connected:
 void setRichPresence(bool on);  // ("Playing <game>": kept in settings.ini)
 size_t listLogins(ChirpLogin* out, size_t cap);  // token.ini's names
 void setLogin(const char* name);  // connect as that one (kept in settings.ini)
+void setGameVolume(int percent);  // (the game's own sound, 0..100: kept in settings.ini)
 void setVolume(int volume);     // (everything Chirp plays: 0..200 percent, kept in people.ini)
 void soundCheck(bool on);
 void reload();

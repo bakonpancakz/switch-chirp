@@ -19,6 +19,7 @@
 #include "card.h"
 #include "gateway.h"
 #include "game.h"
+#include "gamevol.h"
 #include "homelight.h"
 #include "mic.h"
 #include "screen.h"
@@ -40,7 +41,7 @@ const char* const HOST = "gateway.discord.gg";
 const char* const PATH = "/?v=10&encoding=json";
 constexpr size_t LOG_MAX = 64 * 1024;
 constexpr int WAIT_MS = 50;  // the longest a command waits for the network thread
-const uint32_t RETRY_S[] = {1, 2, 3, 3, 3};  // (seconds before trying again: 3 at most, waiting longer only annoys)
+const uint32_t RETRY_S[] = {2, 2, 2, 2, 2};  // (seconds before trying again: always 2, waiting longer only annoys)
 
 // --- the log (no token in it, ever) ---
 
@@ -141,6 +142,7 @@ int g_home_light = 50;  // the HOME button's light while talking: 0 off, else pe
 // Switch is on), and Rich Presence ("Playing <game>"); dirty: say it again
 bool g_invisible = true, g_rpc = false, g_rpc_dirty = true;
 char g_game[CHIRP_NAME] = "";  // (what Rich Presence says: empty, nothing)
+int g_game_volume = 100;       // (settings.ini's, until gamevol has it)
 
 void trim(char* s) {
     size_t n = strlen(s);
@@ -190,6 +192,7 @@ void loadSettings() {
         else if (!strncmp(line, "full_range_video=", 17)) g_full_range = !strcmp(line + 17, "true");
         else if (!strncmp(line, "appear_invisible=", 17)) g_invisible = !strcmp(line + 17, "true");
         else if (!strncmp(line, "rich_presence=", 14)) g_rpc = !strcmp(line + 14, "true");
+        else if (!strncmp(line, "game_volume=", 12)) g_game_volume = atoi(line + 12);
     }
     fclose(f);
 }
@@ -206,9 +209,10 @@ void saveSettings() {
                      "input_volume=%d\ninput_sensitivity=%s\nautomatic_gain=%s\nnoise_suppression=%s\n"
                      "# the HOME button's light while you talk: 0 off, else its brightness in percent (15 levels: 7, 13, 20 ... 100)\nhome_light=%d\n"
                      "# Screenshare: label the video full range (0..255) rather than as grc does (limited, 16..235)\nfull_range_video=%s\n"
-                     "# the bot: offline to everyone while connected; \"Playing <game>\"\nappear_invisible=%s\nrich_presence=%s\n",
+                     "# the bot: offline to everyone while connected; \"Playing <game>\"\nappear_invisible=%s\nrich_presence=%s\n"
+                     "# the game's own volume in percent (0..100), apart from the call's\ngame_volume=%d\n",
                      g_login, g_mic_volume, sens, g_mic_agc ? "true" : "false", g_mic_denoise ? "true" : "false", g_home_light,
-                     g_full_range ? "true" : "false", g_invisible ? "true" : "false", g_rpc ? "true" : "false");
+                     g_full_range ? "true" : "false", g_invisible ? "true" : "false", g_rpc ? "true" : "false", gamevol::percent());
     mutexUnlock(&g_lock);
     Card c;
     if (!c.ok) return;
@@ -571,7 +575,9 @@ bool session(const char* token) {
             // with its name, which needs the screen's queue empty: tried each second until it's known)
             static uint64_t shown_app = ~0ULL;
             static bool capture_known = false;
-            uint64_t app = game::running();
+            uint64_t app_pid = 0;
+            uint64_t app = game::running(&app_pid);
+            gamevol::tick(app_pid);  // (a new game turned down to the game volume)
             bool changed = app != shown_app;
             if (changed) shown_app = app, capture_known = false;
             int capture = -1;
@@ -585,11 +591,20 @@ bool session(const char* token) {
             if (changed || capture >= 0) {
                 static const char* const CAPTURE[] = {"doesn't allow video capture", "allows video capture on request",
                                                       "allows video capture"};
-                char line[160];
+                char line[224];
                 if (!app) snprintf(line, sizeof(line), "application running: none (nothing open, the HOME menu alone)");
                 else snprintf(line, sizeof(line), "application running: %016llX%s, %s", (unsigned long long)app,
                               (app >> 56) == 0x01 ? "" : " (not a game: homebrew?)",
                               capture < 0 ? "its video capture setting not read yet" : capture <= 2 ? CAPTURE[capture] : "an unknown video capture setting");
+                // (the game memory pool: the recorder's 96 MB comes out of it after the title starts, so a
+                // title that takes it all (homebrew: libnx's heap is all that's free) gets no recorder)
+                u64 pool_total = 0, pool_used = 0;
+                if (R_SUCCEEDED(svcGetSystemInfo(&pool_total, 0, INVALID_HANDLE, 0)) &&
+                    R_SUCCEEDED(svcGetSystemInfo(&pool_used, 1, INVALID_HANDLE, 0))) {
+                    size_t at = strlen(line);
+                    snprintf(line + at, sizeof(line) - at, "; game memory %.1f MB free of %.1f",
+                             (pool_total - pool_used) / 1048576.0, pool_total / 1048576.0);
+                }
                 log(line);
             }
         }
@@ -658,6 +673,7 @@ void netThread(void*) {
     }
 
     loadSettings();
+    gamevol::init(g_game_volume);
     mic::setSettings(g_mic_volume, g_mic_sensitivity, g_mic_agc, g_mic_denoise);
     homelight::setBrightness(g_home_light);
     screen::setFullRange(g_full_range);
@@ -686,7 +702,7 @@ void netThread(void*) {
         if (code == 4004 || (code >= 4010 && code <= 4014)) {
             // (trying again won't help: wait for Reload)
             setConn(code == 4004 ? ChirpConn_BadToken : ChirpConn_Refused);
-            log(code == 4004 ? "Discord turned the token down: check token.txt, then Reload"
+            log(code == 4004 ? "Discord turned the token down: check token.ini, then Reload"
                              : "Discord won't take this session as it is: see the close code");
             waitForReload();
             continue;
@@ -869,6 +885,7 @@ void status(ChirpStatus* s) {
     s->full_range = g_full_range;
     s->invisible = g_invisible;
     s->rich_presence = g_rpc;
+    s->game_volume = (uint8_t)gamevol::percent();
     snprintf(s->game, sizeof(s->game), "%s", g_game);
     snprintf(s->login, sizeof(s->login), "%s", g_login_active);
     if (g_session) g_gw.myAvatar(s->avatar);
@@ -1068,6 +1085,11 @@ void setInvisible(bool on) {
     g_gw.setInvisible(on);
     g_rpc_dirty = true;
     mutexUnlock(&g_lock);
+    settingsChanged();
+}
+
+void setGameVolume(int percent) {
+    gamevol::set(percent);  // (its own lock: aud:a isn't called under g_lock)
     settingsChanged();
 }
 
